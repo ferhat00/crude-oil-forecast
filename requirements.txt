@@ -1,0 +1,14 @@
+yfinance>=0.2.36
+fredapi>=0.5.2
+requests>=2.31
+pandas>=2.1
+numpy>=1.26
+scipy>=1.12
+pygam>=0.9.1
+scikit-learn>=1.4
+statsmodels>=0.14
+matplotlib>=3.8
+plotly>=5.18
+streamlit>=1.30
+pyyaml>=6.0
+joblib>=1.3

@@ -1,11 +1,14 @@
 """Reusable Plotly chart builders for the Streamlit dashboard."""
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from scipy import stats
 from pygam import LinearGAM
+
+from src.evaluation import PredictiveDistribution
 
 # ── Shared colour palette ────────────────────────────────────────────────────
 # CI bands in shades of blue, innermost (50%) darkest, outermost (95%) lightest
@@ -23,6 +26,20 @@ def _get_sigma_from_gam(gam: LinearGAM, X: np.ndarray) -> np.ndarray:
     """Back out per-observation predictive σ from the 95% PI."""
     pi_95 = gam.prediction_intervals(X, width=0.95)
     return np.clip((pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96), 1e-6, None)
+
+
+def _get_intervals(
+    gam: LinearGAM,
+    X: np.ndarray,
+    y_pred: np.ndarray,
+    sigma: np.ndarray,
+    widths: list[float],
+    dist: PredictiveDistribution | None,
+) -> dict[float, np.ndarray]:
+    """Compute PI arrays using Johnson SU (if dist) or Gaussian (fallback)."""
+    if dist is not None:
+        return dist.get_all_intervals(y_pred, sigma, widths)
+    return {w: gam.prediction_intervals(X, width=w) for w in widths}
 
 
 # ── Price overview ───────────────────────────────────────────────────────────
@@ -58,21 +75,23 @@ def plot_fan_chart_plotly(
     X: np.ndarray,
     widths: list[float] | None = None,
     last_n_days: int = 500,
+    dist: PredictiveDistribution | None = None,
 ) -> go.Figure:
     """Interactive fan chart with layered confidence bands in shades of blue.
 
-    Each band represents a prediction interval at a different confidence level.
-    The innermost band (50% PI) is the darkest — prices are expected to fall
-    inside it half the time. The outermost (95% PI) is the lightest.
+    When *dist* is provided the CI bands are computed from the Johnson SU
+    distribution (asymmetric, potentially heavier-tailed) rather than the
+    Gaussian PIs from pyGAM.
 
     Args:
         dates: DatetimeIndex aligned with y_true / y_pred / X.
         y_true: Actual prices.
         y_pred: GAM point predictions.
-        gam: Fitted LinearGAM (used to compute PIs).
+        gam: Fitted LinearGAM.
         X: Feature matrix aligned with dates.
         widths: CI levels to draw (default: 50/80/90/95%).
         last_n_days: Show only the most recent N trading days.
+        dist: Optional :class:`~src.evaluation.PredictiveDistribution`.
 
     Returns:
         Plotly Figure.
@@ -86,9 +105,10 @@ def plot_fan_chart_plotly(
     y_pred_n = y_pred[-n:]
     X_n = X[-n:]
 
-    # Pre-compute all intervals
-    intervals = {w: gam.prediction_intervals(X_n, width=w) for w in widths}
+    sigma_n = _get_sigma_from_gam(gam, X_n)
+    intervals = _get_intervals(gam, X_n, y_pred_n, sigma_n, widths, dist)
 
+    dist_tag = " (Johnson SU)" if dist is not None else " (Gaussian)"
     fig = go.Figure()
 
     # Draw bands widest → narrowest so narrower bands sit on top
@@ -99,9 +119,8 @@ def plot_fan_chart_plotly(
     ):
         lower = intervals[width][:, 0]
         upper = intervals[width][:, 1]
-        label = f"{int(width * 100)}% PI"
+        label = f"{int(width * 100)}% PI{dist_tag}"
 
-        # Upper bound (invisible line, just the fill boundary)
         fig.add_trace(go.Scatter(
             x=dates_n, y=upper,
             mode="lines",
@@ -111,7 +130,6 @@ def plot_fan_chart_plotly(
             showlegend=True,
             hovertemplate=f"{label} upper: $%{{y:.2f}}<extra></extra>",
         ))
-        # Lower bound + fill back to upper
         fig.add_trace(go.Scatter(
             x=dates_n, y=lower,
             mode="lines",
@@ -124,15 +142,12 @@ def plot_fan_chart_plotly(
             hovertemplate=f"{label} lower: $%{{y:.2f}}<extra></extra>",
         ))
 
-    # Point forecast
     fig.add_trace(go.Scatter(
         x=dates_n, y=y_pred_n,
         mode="lines", name="Point forecast",
         line=dict(color="#08306b", width=1.5),
         hovertemplate="Forecast: $%{y:.2f}<extra></extra>",
     ))
-
-    # Actual price
     fig.add_trace(go.Scatter(
         x=dates_n, y=y_true_n,
         mode="lines", name="Actual",
@@ -141,7 +156,7 @@ def plot_fan_chart_plotly(
     ))
 
     fig.update_layout(
-        title="Crude Oil Forecast — Fan Chart",
+        title=f"Crude Oil Forecast — Fan Chart{dist_tag}",
         xaxis_title="Date", yaxis_title="Price (USD)",
         template="plotly_white", hovermode="x unified",
         xaxis=dict(rangeslider=dict(visible=True), type="date"),
@@ -158,27 +173,22 @@ def plot_predictive_density_plotly(
     y_actual: float | None = None,
     widths: list[float] | None = None,
     title: str = "Predictive Distribution",
+    dist: PredictiveDistribution | None = None,
 ) -> go.Figure:
     """Probability density curve for a single forecast.
 
-    Draws a Normal PDF centred at the point forecast μ with spread σ.
-    Quantile bands are filled in progressively lighter blues — the user
-    can immediately see that the darkest central region contains 50% of
-    the probability mass, and the full shaded area contains 95%.
-
-    Layout:
-        X-axis  → crude oil price (USD)
-        Y-axis  → probability density
-        Bands   → 50/80/90/95% PI, dark-blue → light-blue
-        Dashed  → point forecast
-        Red bar → actual price (if provided)
+    When *dist* is provided a Johnson SU PDF (4 parameters: ν, τ, loc, scale)
+    is drawn, capturing skewness and heavy tails.  The CI bands and forecast
+    percentile are computed from the same distribution.  Without *dist* a
+    Gaussian PDF is used as fallback.
 
     Args:
-        mu: Point forecast (mean of the predictive Normal).
-        sigma: Predictive std deviation.
-        y_actual: Actual realised price (optional marker).
+        mu: GAM point forecast.
+        sigma: Per-observation predictive std deviation.
+        y_actual: Actual realised price (optional red marker).
         widths: Quantile widths to shade.
         title: Chart title.
+        dist: Optional :class:`~src.evaluation.PredictiveDistribution`.
 
     Returns:
         Plotly Figure.
@@ -186,16 +196,32 @@ def plot_predictive_density_plotly(
     if widths is None:
         widths = _CI_LEVELS
 
-    # Build x-grid spanning ±4σ
-    x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 800)
-    pdf = stats.norm.pdf(x, loc=mu, scale=sigma)
+    use_johnsonsu = dist is not None
+
+    # ── Build x-grid ──────────────────────────────────────────────────────────
+    if use_johnsonsu:
+        x_lo = dist.ppf(0.001, mu, sigma)
+        x_hi = dist.ppf(0.999, mu, sigma)
+        margin = (x_hi - x_lo) * 0.1
+        x = np.linspace(x_lo - margin, x_hi + margin, 800)
+        pdf = dist.pdf(x, mu, sigma)
+        pdf_label = f"Johnson SU PDF (ν={dist.nu:.2f}, τ={dist.tau:.2f})"
+    else:
+        x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 800)
+        pdf = stats.norm.pdf(x, loc=mu, scale=sigma)
+        pdf_label = "Gaussian PDF"
 
     fig = go.Figure()
 
-    # Fill bands widest → narrowest (lightest → darkest)
+    # ── CI bands widest → narrowest ───────────────────────────────────────────
     for width, fill in zip(reversed(widths), reversed(_CI_FILL_RGBA[: len(widths)])):
-        z = stats.norm.ppf(0.5 + width / 2)
-        lo, hi = mu - z * sigma, mu + z * sigma
+        if use_johnsonsu:
+            lo = dist.ppf((1 - width) / 2, mu, sigma)
+            hi = dist.ppf((1 + width) / 2, mu, sigma)
+        else:
+            z = stats.norm.ppf(0.5 + width / 2)
+            lo, hi = mu - z * sigma, mu + z * sigma
+
         mask = (x >= lo) & (x <= hi)
         label = f"{int(width * 100)}% PI  [${lo:.1f} – ${hi:.1f}]"
 
@@ -212,16 +238,16 @@ def plot_predictive_density_plotly(
             hoverinfo="skip",
         ))
 
-    # Full PDF curve on top of all fills
+    # ── Full PDF curve ─────────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=x, y=pdf,
         mode="lines",
         line=dict(color="#08306b", width=2.5),
-        name="Predictive PDF",
+        name=pdf_label,
         hovertemplate="Price: $%{x:.2f}<br>Density: %{y:.4f}<extra></extra>",
     ))
 
-    # Point forecast marker
+    # ── Point forecast marker ──────────────────────────────────────────────────
     fig.add_vline(
         x=mu,
         line=dict(color="#08306b", dash="dash", width=1.5),
@@ -230,7 +256,7 @@ def plot_predictive_density_plotly(
         annotation_font_color="#08306b",
     )
 
-    # Actual price marker
+    # ── Actual price marker ────────────────────────────────────────────────────
     if y_actual is not None:
         fig.add_vline(
             x=y_actual,
@@ -329,27 +355,42 @@ def plot_what_if_analysis(
     vary_feature_idx: int,
     vary_range: np.ndarray,
     feature_name: str,
+    dist: PredictiveDistribution | None = None,
 ) -> go.Figure:
-    """Predicted price as one feature sweeps across a range, with CI band."""
+    """Predicted price as one feature sweeps across a range, with CI band.
+
+    If *dist* is provided the 95% CI uses Johnson SU quantiles.
+    """
     predictions, ci_lower, ci_upper = [], [], []
+    sigma_base = _get_sigma_from_gam(gam, base_X)
+
     for val in vary_range:
         X_mod = base_X.copy()
         X_mod[0, vary_feature_idx] = val
-        predictions.append(gam.predict(X_mod)[0])
-        ci = gam.prediction_intervals(X_mod, width=0.95)
-        ci_lower.append(ci[0, 0])
-        ci_upper.append(ci[0, 1])
+        mu_val = gam.predict(X_mod)[0]
+        predictions.append(mu_val)
+
+        if dist is not None:
+            sig_val = float(_get_sigma_from_gam(gam, X_mod)[0])
+            ci_lower.append(dist.ppf(0.025, mu_val, sig_val))
+            ci_upper.append(dist.ppf(0.975, mu_val, sig_val))
+        else:
+            ci = gam.prediction_intervals(X_mod, width=0.95)
+            ci_lower.append(ci[0, 0])
+            ci_upper.append(ci[0, 1])
 
     predictions = np.array(predictions)
     ci_lower = np.array(ci_lower)
     ci_upper = np.array(ci_upper)
+
+    ci_label = "95% CI (Johnson SU)" if dist is not None else "95% CI (Gaussian)"
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=np.concatenate([vary_range, vary_range[::-1]]),
         y=np.concatenate([ci_lower, ci_upper[::-1]]),
         fill="toself", fillcolor="rgba(255, 127, 14, 0.15)",
-        line=dict(color="rgba(255,255,255,0)"), name="95% CI",
+        line=dict(color="rgba(255,255,255,0)"), name=ci_label,
     ))
     fig.add_trace(go.Scatter(
         x=vary_range, y=predictions, mode="lines",

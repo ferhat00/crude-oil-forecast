@@ -72,4 +72,6 @@ model:
   n_splines: 25
   lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
   cv_splits: 5
-  embargo_days: 200  # Obs to drop between train/test boundary (= max rolling window)
+  embargo_days: 200         # Obs to drop between train/test boundary (= max rolling window)
+  stepwise_selection: true  # Backward AIC elimination to drop irrelevant/redundant features
+  stepwise_max_steps: 50    # Max elimination iterations (null = unlimited)

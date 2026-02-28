@@ -95,6 +95,52 @@ def _classify_feature(name: str) -> str:
     return "spline"  # default
 
 
+def _build_gam_terms_for_indices(
+    feature_indices: list[int],
+    all_feature_names: list[str],
+    config: dict,
+) -> object:
+    """Build pyGAM terms for a subset of features, re-indexed sequentially.
+
+    When features are dropped during stepwise selection the remaining
+    features must be re-numbered 0, 1, 2, … so that pyGAM's column indices
+    align with the subsetted ``X[:, feature_indices]`` matrix.
+
+    Args:
+        feature_indices: Ordered column positions in the *full* feature matrix.
+        all_feature_names: Names for every column of the full feature matrix.
+        config: Project configuration (for n_splines).
+
+    Returns:
+        pyGAM terms expression.
+    """
+    n_splines_default = config.get("model", {}).get("n_splines", 25)
+    terms = None
+
+    for new_idx, orig_idx in enumerate(feature_indices):
+        name = all_feature_names[orig_idx]
+        category = _classify_feature(name)
+
+        if category == "linear":
+            term = l(new_idx)
+        elif category == "cyclic":
+            n_sp = 7 if "day_of_week" in name else 12 if "month" in name else 30
+            term = s(new_idx, n_splines=n_sp, basis="cp")
+        elif category == "rolling":
+            term = s(new_idx, n_splines=n_splines_default)
+        elif category == "lag":
+            term = s(new_idx, n_splines=20)
+        elif category == "return":
+            term = s(new_idx, n_splines=15)
+        else:
+            term = s(new_idx, n_splines=20)
+
+        terms = term if terms is None else terms + term
+        logger.debug(f"  new={new_idx} orig={orig_idx}: {name} -> {category}")
+
+    return terms
+
+
 def define_gam_terms(
     feature_names: list[str],
     config: dict,
@@ -116,30 +162,9 @@ def define_gam_terms(
     Returns:
         pyGAM terms expression.
     """
-    n_splines_default = config.get("model", {}).get("n_splines", 25)
-    terms = None
-
-    for i, name in enumerate(feature_names):
-        category = _classify_feature(name)
-
-        if category == "linear":
-            term = l(i)
-        elif category == "cyclic":
-            # Cyclic splines for calendar features
-            n_sp = 7 if "day_of_week" in name else 12 if "month" in name else 30
-            term = s(i, n_splines=n_sp, basis="cp")
-        elif category == "rolling":
-            term = s(i, n_splines=n_splines_default)
-        elif category == "lag":
-            term = s(i, n_splines=20)
-        elif category == "return":
-            term = s(i, n_splines=15)
-        else:
-            term = s(i, n_splines=20)
-
-        terms = term if terms is None else terms + term
-        logger.debug(f"  Feature {i}: {name} -> {category}")
-
+    terms = _build_gam_terms_for_indices(
+        list(range(len(feature_names))), feature_names, config
+    )
     logger.info(f"Defined {len(feature_names)} GAM terms")
     return terms
 
@@ -313,6 +338,117 @@ def cross_validate(
     return results
 
 
+def stepwise_aic_selection(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: list[str],
+    config: dict,
+    lam_values: list[float] | None = None,
+    max_steps: int | None = None,
+) -> tuple[np.ndarray, list[int], list[str], list[str], LinearGAM]:
+    """Iterative backward AIC elimination for GAM feature selection.
+
+    At each step the least-significant term (highest p-value) is the candidate
+    for removal.  A trial model is fitted *without* that term using a fixed λ
+    (inherited from the previous step) for speed.  The drop is accepted when
+    trial AIC ≤ current AIC.  Once no single removal improves AIC the loop
+    stops and the final model is refit with a full grid-search.
+
+    This removes redundant, correlated, or uninformative features, reducing
+    model complexity and the risk of over-fitting.
+
+    Args:
+        X: Full feature matrix (n_samples × n_features).
+        y: Target vector.
+        feature_names: Column names aligned with X.
+        config: Project configuration.
+        lam_values: Lambda values for the initial and final grid-search.
+            Trial fits inside the loop use fixed λ (fast).
+        max_steps: Maximum elimination iterations (default: len(feature_names)).
+
+    Returns:
+        Tuple of (X_selected, selected_indices, selected_names, dropped_names, gam).
+        ``X_selected`` is ``X[:, selected_indices]`` and ``gam`` is the final
+        model fitted on the selected features with a full grid-search.
+    """
+    if max_steps is None:
+        max_steps = len(feature_names)
+
+    current_indices = list(range(len(feature_names)))
+    dropped_names: list[str] = []
+
+    # ── Initial full model (grid-search) ─────────────────────────────────────
+    terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
+    gam = fit_gam(X[:, current_indices], y, terms, lam_values)
+    current_aic = gam.statistics_["AIC"]
+    current_lam = gam.lam  # reuse for fast trial fits
+
+    logger.info(
+        f"Stepwise AIC selection — start: {len(current_indices)} features, "
+        f"AIC={current_aic:.4f}"
+    )
+
+    for step in range(max_steps):
+        if len(current_indices) <= 1:
+            break
+
+        p_values = list(gam.statistics_.get("p_values", []))
+        if not p_values:
+            logger.warning("p_values unavailable — stopping stepwise selection.")
+            break
+
+        # Align p-values with current feature count (exclude intercept if present)
+        term_pvals = np.array(p_values[: len(current_indices)])
+        worst_local = int(np.argmax(term_pvals))
+        worst_pval = float(term_pvals[worst_local])
+        candidate_orig = current_indices[worst_local]
+        candidate_name = feature_names[candidate_orig]
+
+        # ── Trial: fit without the worst term (fast, fixed λ) ─────────────────
+        trial_indices = [idx for i, idx in enumerate(current_indices) if i != worst_local]
+        trial_terms = _build_gam_terms_for_indices(trial_indices, feature_names, config)
+
+        # Build a fixed-λ model (no grid-search) for speed
+        trial_lam = [lv for i, lv in enumerate(current_lam) if i != worst_local]
+        trial_gam_fast = LinearGAM(trial_terms)
+        trial_gam_fast.lam = trial_lam
+        trial_gam_fast.fit(X[:, trial_indices], y)
+        trial_aic = trial_gam_fast.statistics_["AIC"]
+
+        if trial_aic <= current_aic:
+            logger.info(
+                f"  Step {step + 1}: drop '{candidate_name}' "
+                f"(p={worst_pval:.4f}, AIC {current_aic:.4f} → {trial_aic:.4f} ✓)"
+            )
+            dropped_names.append(candidate_name)
+            current_indices = trial_indices
+            gam = trial_gam_fast
+            current_aic = trial_aic
+            current_lam = gam.lam
+        else:
+            logger.info(
+                f"  Step {step + 1}: keeping '{candidate_name}' "
+                f"(p={worst_pval:.4f}, AIC would worsen "
+                f"{current_aic:.4f} → {trial_aic:.4f} ✗). Stopping."
+            )
+            break
+
+    selected_names = [feature_names[i] for i in current_indices]
+    logger.info(
+        f"Stepwise complete: kept {len(selected_names)}/{len(feature_names)} features, "
+        f"dropped {len(dropped_names)}: {dropped_names}"
+    )
+
+    # ── Final model: full grid-search on selected features ────────────────────
+    if dropped_names:
+        logger.info("Refitting final model on selected features (full grid-search)…")
+        final_terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
+        gam = fit_gam(X[:, current_indices], y, final_terms, lam_values)
+        logger.info(f"Final AIC after grid-search: {gam.statistics_['AIC']:.4f}")
+
+    return X[:, current_indices], current_indices, selected_names, dropped_names, gam
+
+
 def save_model(gam: LinearGAM, path: str | Path = "outputs/models/gam_model.pkl") -> None:
     """Serialize fitted GAM model to disk."""
     path = Path(path)
@@ -344,7 +480,15 @@ def load_feature_names(
 
 
 def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
-    """Full training pipeline: load data, cross-validate, fit, save.
+    """Full training pipeline: load data, (optionally) select features, CV, fit, save.
+
+    Pipeline order:
+    1. Build full feature matrix.
+    2. If ``model.stepwise_selection`` is true, run backward AIC elimination
+       on the full dataset to identify a parsimonious feature set.
+    3. Run embargoed time-series cross-validation on the selected features.
+    4. Fit the final model on all data.
+    5. Persist model + feature names.
 
     Args:
         config: Project configuration dictionary.
@@ -354,6 +498,8 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
     """
     root = get_project_root(config)
     model_dir = root / "outputs" / "models"
+    model_cfg = config.get("model", {})
+    lam_values = model_cfg.get("lam_search")
 
     # Load features
     df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
@@ -362,21 +508,34 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
     # Build feature matrix
     X, y, feature_names = build_feature_matrix(df, target)
 
-    # Define GAM terms
+    # ── Optional stepwise AIC feature selection ───────────────────────────────
+    if model_cfg.get("stepwise_selection", False):
+        logger.info("Running stepwise AIC feature selection…")
+        X, _, feature_names, dropped, _ = stepwise_aic_selection(
+            X, y, feature_names, config,
+            lam_values=lam_values,
+            max_steps=model_cfg.get("stepwise_max_steps"),
+        )
+        logger.info(f"Selected {len(feature_names)} features after stepwise selection.")
+        if dropped:
+            logger.info(f"Dropped features: {dropped}")
+
+    # Build terms over the (possibly reduced) feature set.
+    # feature_names is already the selected subset after stepwise_aic_selection,
+    # so sequential 0-based indexing via define_gam_terms is correct.
     terms = define_gam_terms(feature_names, config)
 
-    # Cross-validate
-    model_cfg = config.get("model", {})
+    # Cross-validate on selected features
     cv_results = cross_validate(
         X, y, terms,
         n_splits=model_cfg.get("cv_splits", 5),
         embargo_days=model_cfg.get("embargo_days", 200),
-        lam_values=model_cfg.get("lam_search"),
+        lam_values=lam_values,
     )
 
-    # Fit on full dataset
+    # Fit final model on full dataset
     logger.info("Fitting final model on full dataset...")
-    gam = fit_gam(X, y, terms, model_cfg.get("lam_search"))
+    gam = fit_gam(X, y, terms, lam_values)
 
     # Save model and feature names
     save_model(gam, model_dir / "gam_model.pkl")

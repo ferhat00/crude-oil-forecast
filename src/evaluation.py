@@ -3,6 +3,8 @@
 import logging
 from pathlib import Path
 
+import dataclasses
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -13,7 +15,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from src.config_loader import get_project_root
-from src.model import build_feature_matrix, load_model
+from src.model import build_feature_matrix, load_feature_names, load_model
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,141 @@ CI_LEVELS = [0.50, 0.80, 0.90, 0.95]
 # ColorBrewer Blues: darkest at centre, lightest at the outside
 CI_COLORS_MPL = ["#2171b5", "#6baed6", "#bdd7e7", "#eff3ff"]
 CI_ALPHAS_MPL = [0.75, 0.55, 0.40, 0.25]
+
+
+# ─────────────────────────────────────────────
+# 4-Parameter Predictive Distribution (Johnson SU)
+# ─────────────────────────────────────────────
+
+@dataclasses.dataclass
+class PredictiveDistribution:
+    """Johnson SU (Sinh-Arcsinh / SHASH) predictive distribution.
+
+    Encapsulates the four parameters estimated from model residuals:
+
+    * **ν (nu)** — skewness shape.  ν = 0 is symmetric; ν > 0 right-skewed.
+    * **τ (tau)** — tail-weight shape (must be > 0).  Smaller τ → heavier
+      tails than Normal; τ → ∞ approaches Gaussian tails.
+    * **loc_std** — mean of the standardised residuals (ideally ≈ 0).
+    * **scale_std** — scale of the standardised residuals (ideally ≈ 1).
+
+    For a new prediction with GAM mean *μ* and heteroscedastic scale *σ*
+    (derived from the GAM's 95% PI), the realised distribution is::
+
+        johnsonsu(ν, τ, loc = μ + σ·loc_std, scale = σ·scale_std)
+
+    This preserves the per-observation scale heterogeneity from the GAM
+    while replacing the Normal assumption with a distribution that can
+    capture skewness and excess kurtosis in the residuals.
+    """
+    nu: float        # skewness parameter (a in scipy)
+    tau: float       # tail-weight parameter (b in scipy); smaller = fatter tails
+    loc_std: float   # location offset in standardised space
+    scale_std: float # scale in standardised space
+
+    # ── Per-observation distribution helpers ─────────────────────────────────
+
+    def _params(self, mu: float, sigma: float) -> tuple:
+        """Return the (a, b, loc, scale) scipy args for one prediction."""
+        return (
+            self.nu,
+            self.tau,
+            float(mu) + float(sigma) * self.loc_std,
+            float(sigma) * self.scale_std,
+        )
+
+    def pdf(self, x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+        """Evaluate the predictive PDF at price grid *x*."""
+        a, b, loc, scale = self._params(mu, sigma)
+        return stats.johnsonsu.pdf(x, a, b, loc=loc, scale=scale)
+
+    def ppf(self, q: float, mu: float, sigma: float) -> float:
+        """Percent-point function (inverse CDF) at quantile *q*."""
+        a, b, loc, scale = self._params(mu, sigma)
+        return float(stats.johnsonsu.ppf(q, a, b, loc=loc, scale=scale))
+
+    def cdf(self, x: float, mu: float, sigma: float) -> float:
+        """CDF evaluated at price *x*."""
+        a, b, loc, scale = self._params(mu, sigma)
+        return float(stats.johnsonsu.cdf(x, a, b, loc=loc, scale=scale))
+
+    # ── Vectorised over many observations ─────────────────────────────────────
+
+    def ppf_array(self, q: float, y_pred: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+        """Return PPF at quantile *q* for each (μ_i, σ_i) pair."""
+        return np.array([self.ppf(q, m, s) for m, s in zip(y_pred, sigma)])
+
+    def get_all_intervals(
+        self,
+        y_pred: np.ndarray,
+        sigma: np.ndarray,
+        widths: list[float] | None = None,
+    ) -> dict[float, np.ndarray]:
+        """Compute prediction intervals at multiple confidence levels.
+
+        Returns:
+            Dict mapping width → array of shape (n, 2) with [lower, upper].
+        """
+        if widths is None:
+            widths = CI_LEVELS
+        result = {}
+        for w in widths:
+            q_lo = (1.0 - w) / 2.0
+            q_hi = (1.0 + w) / 2.0
+            lower = self.ppf_array(q_lo, y_pred, sigma)
+            upper = self.ppf_array(q_hi, y_pred, sigma)
+            result[w] = np.column_stack([lower, upper])
+        return result
+
+    def describe(self) -> str:
+        tail_desc = (
+            "heavier than Normal (leptokurtic)"
+            if self.tau < 1.0
+            else "similar to or lighter than Normal"
+        )
+        skew_desc = (
+            "right-skewed" if self.nu > 0.05
+            else "left-skewed" if self.nu < -0.05
+            else "approximately symmetric"
+        )
+        return (
+            f"Johnson SU: ν={self.nu:.4f} ({skew_desc}), "
+            f"τ={self.tau:.4f} ({tail_desc}), "
+            f"loc_std={self.loc_std:.4f}, scale_std={self.scale_std:.4f}"
+        )
+
+
+def fit_residual_distribution(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    sigma: np.ndarray,
+) -> PredictiveDistribution:
+    """Fit a Johnson SU distribution to the standardised model residuals.
+
+    Standardising by the per-observation GAM scale *σ* means the fitted
+    shape parameters (ν, τ) capture the distributional form of the errors
+    independently of their magnitude, while the magnitude is preserved
+    through *σ* at prediction time.
+
+    Args:
+        y_true: Observed values.
+        y_pred: GAM point predictions (aligned with y_true).
+        sigma: Per-observation predictive std deviations (from GAM 95% PI).
+
+    Returns:
+        Fitted :class:`PredictiveDistribution`.
+    """
+    residuals = y_true - y_pred
+    r_std = residuals / np.clip(sigma, 1e-8, None)   # standardise
+
+    # scipy.stats.johnsonsu.fit returns (a=ν, b=τ, loc, scale)
+    nu, tau, loc_std, scale_std = stats.johnsonsu.fit(r_std)
+
+    dist = PredictiveDistribution(
+        nu=nu, tau=tau, loc_std=loc_std, scale_std=scale_std
+    )
+    logger.info(f"Fitted predictive distribution — {dist.describe()}")
+    return dist
 
 
 # ─────────────────────────────────────────────
@@ -96,20 +233,31 @@ def get_all_prediction_intervals(
     gam,
     X: np.ndarray,
     widths: list[float] | None = None,
+    dist: "PredictiveDistribution | None" = None,
 ) -> dict[float, np.ndarray]:
     """Compute prediction intervals at multiple confidence levels.
+
+    If a :class:`PredictiveDistribution` is supplied the intervals are based
+    on the fitted Johnson SU quantiles (potentially asymmetric, with heavier
+    tails).  Otherwise falls back to the Gaussian intervals from pyGAM.
 
     Args:
         gam: Fitted LinearGAM.
         X: Feature matrix.
         widths: List of PI widths (e.g., [0.50, 0.80, 0.90, 0.95]).
+        dist: Optional fitted :class:`PredictiveDistribution`.
 
     Returns:
         Dict mapping width → array of shape (n_samples, 2) with [lower, upper].
     """
     if widths is None:
         widths = CI_LEVELS
-    return {w: gam.prediction_intervals(X, width=w) for w in widths}
+    if dist is None:
+        return {w: gam.prediction_intervals(X, width=w) for w in widths}
+
+    y_pred = gam.predict(X)
+    sigma = get_prediction_sigma(gam, X)
+    return dist.get_all_intervals(y_pred, sigma, widths)
 
 
 # ─────────────────────────────────────────────
@@ -125,6 +273,7 @@ def plot_fan_chart(
     widths: list[float] | None = None,
     last_n_days: int = 500,
     save_path: str | Path = "outputs/figures/fan_chart.png",
+    dist: "PredictiveDistribution | None" = None,
 ) -> None:
     """Plot a fan chart: actual line + point forecast + stacked CI bands.
 
@@ -132,15 +281,20 @@ def plot_fan_chart(
     The innermost (50%) band is the darkest, giving an intuitive sense
     of where the price is most likely to fall.
 
+    When *dist* is provided the bands are computed from the Johnson SU
+    distribution (asymmetric, potentially heavier-tailed than Normal).
+
     Args:
         dates: DatetimeIndex aligned with y_true / y_pred.
         y_true: Actual prices.
         y_pred: GAM point predictions.
-        gam: Fitted LinearGAM (for prediction intervals).
+        gam: Fitted LinearGAM (for prediction intervals / sigma).
         X: Feature matrix aligned with dates.
         widths: CI levels to draw.
         last_n_days: Limit chart to this many recent trading days.
         save_path: Where to save the figure.
+        dist: Optional :class:`PredictiveDistribution`; uses Johnson SU PIs
+            when supplied, Gaussian PIs otherwise.
     """
     if widths is None:
         widths = CI_LEVELS
@@ -152,7 +306,7 @@ def plot_fan_chart(
     y_pred_n = y_pred[-n:]
     X_n = X[-n:]
 
-    intervals = get_all_prediction_intervals(gam, X_n, widths)
+    intervals = get_all_prediction_intervals(gam, X_n, widths, dist=dist)
 
     fig, ax = plt.subplots(figsize=(16, 7))
 
@@ -200,12 +354,13 @@ def plot_predictive_density(
     widths: list[float] | None = None,
     save_path: str | Path = "outputs/figures/predictive_density.png",
     title: str = "Predictive Distribution",
+    dist: "PredictiveDistribution | None" = None,
 ) -> None:
     """Plot the predictive probability density curve for a single forecast.
 
-    Draws a Normal PDF centred at the point forecast μ with spread σ.
-    Quantile bands are filled in progressively lighter blues so the eye
-    is immediately drawn to the most probable price region.
+    When *dist* is supplied the curve is a Johnson SU PDF with four
+    parameters (ν, τ, loc, scale), capturing skewness and heavier tails.
+    Without *dist* a Gaussian PDF is used as a fallback.
 
     Layout:
         X-axis → crude oil price (USD)
@@ -215,19 +370,34 @@ def plot_predictive_density(
         Red marker  → actual price (if provided)
 
     Args:
-        mu: Point forecast (mean of the predictive distribution).
-        sigma: Predictive std deviation (from get_prediction_sigma).
+        mu: GAM point forecast.
+        sigma: Heteroscedastic predictive std deviation (from GAM 95% PI).
         y_actual: Actual realised price (optional, drawn as a red line).
         widths: Quantile bands to fill.
         save_path: Where to save the figure.
         title: Figure title.
+        dist: Optional :class:`PredictiveDistribution`; uses Johnson SU when
+            supplied, Normal otherwise.
     """
     if widths is None:
         widths = CI_LEVELS
 
-    # Build x-axis spanning ±4σ around the forecast
-    x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 1000)
-    pdf = stats.norm.pdf(x, loc=mu, scale=sigma)
+    use_johnsonsu = dist is not None
+
+    # Build x-axis: use Johnson SU 0.1–99.9th percentile range so we always
+    # capture the full density regardless of tail heaviness
+    if use_johnsonsu:
+        x_lo = dist.ppf(0.001, mu, sigma)
+        x_hi = dist.ppf(0.999, mu, sigma)
+        # Widen slightly for visual breathing room
+        margin = (x_hi - x_lo) * 0.1
+        x = np.linspace(x_lo - margin, x_hi + margin, 1000)
+        pdf = dist.pdf(x, mu, sigma)
+        dist_label = f"Johnson SU (ν={dist.nu:.2f}, τ={dist.tau:.2f})"
+    else:
+        x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 1000)
+        pdf = stats.norm.pdf(x, loc=mu, scale=sigma)
+        dist_label = "Gaussian"
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -237,9 +407,13 @@ def plot_predictive_density(
         reversed(CI_COLORS_MPL[: len(widths)]),
         reversed(CI_ALPHAS_MPL[: len(widths)]),
     ):
-        z = stats.norm.ppf(0.5 + width / 2)
-        lower = mu - z * sigma
-        upper = mu + z * sigma
+        if use_johnsonsu:
+            lower = dist.ppf((1 - width) / 2, mu, sigma)
+            upper = dist.ppf((1 + width) / 2, mu, sigma)
+        else:
+            z = stats.norm.ppf(0.5 + width / 2)
+            lower = mu - z * sigma
+            upper = mu + z * sigma
         mask = (x >= lower) & (x <= upper)
         ax.fill_between(
             x[mask], pdf[mask],
@@ -248,7 +422,7 @@ def plot_predictive_density(
         )
 
     # Full PDF curve
-    ax.plot(x, pdf, color="#08306b", linewidth=2, label="Predictive PDF")
+    ax.plot(x, pdf, color="#08306b", linewidth=2, label=f"Predictive PDF ({dist_label})")
 
     # Point forecast line
     ax.axvline(mu, color="#08306b", linestyle="--", linewidth=1.2,
@@ -596,7 +770,25 @@ def run_evaluation(config: dict) -> pd.DataFrame:
     target = config["features"]["target"]
     gam = load_model(root / "outputs" / "models" / "gam_model.pkl")
 
-    X, y, feature_names = build_feature_matrix(df, target)
+    # Build the full feature matrix, then restrict to the columns the model
+    # was actually trained on (stepwise selection may have dropped features).
+    X_full, y, all_feature_names = build_feature_matrix(df, target)
+    saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
+    feature_names = (
+        load_feature_names(saved_names_path)
+        if saved_names_path.exists()
+        else all_feature_names
+    )
+    # Map saved names → column positions in the full matrix
+    name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
+    try:
+        col_idx = [name_to_idx[n] for n in feature_names]
+    except KeyError as missing:
+        raise ValueError(
+            f"Saved feature name {missing} not found in feature matrix. "
+            "Re-run the pipeline to regenerate features and model."
+        )
+    X = X_full[:, col_idx]
 
     y_gam = gam.predict(X)
     y_naive = naive_baseline_predictions(y)
@@ -616,19 +808,25 @@ def run_evaluation(config: dict) -> pd.DataFrame:
     plot_actual_vs_predicted(df.index, y, y_gam, fig_dir / "actual_vs_pred.png")
     plot_residual_diagnostics(y, y_gam, fig_dir / "residuals.png")
 
-    # ── Probability forecast plots ────────────────────────────────────────────
-    # Fan chart (last 500 trading days)
-    plot_fan_chart(df.index, y, y_gam, gam, X,
-                   save_path=fig_dir / "fan_chart.png")
-
-    # Predictive density for the most recent observation
+    # ── Fit 4-parameter Johnson SU predictive distribution ───────────────────
     sigma = get_prediction_sigma(gam, X)
+    dist = fit_residual_distribution(y, y_gam, sigma)
+    logger.info(f"Predictive distribution: {dist.describe()}")
+
+    # ── Probability forecast plots ────────────────────────────────────────────
+    # Fan chart (last 500 trading days) — Johnson SU bands
+    plot_fan_chart(df.index, y, y_gam, gam, X,
+                   save_path=fig_dir / "fan_chart.png",
+                   dist=dist)
+
+    # Predictive density for the most recent observation — Johnson SU curve
     plot_predictive_density(
         mu=float(y_gam[-1]),
         sigma=float(sigma[-1]),
         y_actual=float(y[-1]),
         save_path=fig_dir / "predictive_density.png",
         title="Predictive Distribution — Most Recent Observation",
+        dist=dist,
     )
 
     # ── Advanced residual diagnostics ─────────────────────────────────────────

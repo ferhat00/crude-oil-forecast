@@ -24,7 +24,13 @@ from app.components import (
     _get_sigma_from_gam,
 )
 from src.config_loader import load_config
-from src.evaluation import compute_metrics, naive_baseline_predictions
+from src.evaluation import (
+    PredictiveDistribution,
+    compute_metrics,
+    fit_residual_distribution,
+    get_prediction_sigma,
+    naive_baseline_predictions,
+)
 from src.model import build_feature_matrix, load_feature_names, load_model
 
 
@@ -41,6 +47,27 @@ def load_gam_model(root: str):
 @st.cache_data
 def load_features(root: str) -> list[str]:
     return load_feature_names(Path(root) / "outputs" / "models" / "feature_names.pkl")
+
+
+@st.cache_resource
+def build_predictive_dist(root: str, _gam) -> PredictiveDistribution:
+    """Fit Johnson SU predictive distribution from in-sample residuals.
+
+    The leading underscore on ``_gam`` prevents Streamlit from attempting to
+    hash the model object (which would fail); the distribution is keyed only
+    on ``root``.  Call this after loading the model so the cache key is stable.
+    """
+    df = load_data(root)
+    cfg = load_config()
+    target = cfg["features"]["target"]
+    feature_names = load_features(root)
+    X_full, y, all_names = build_feature_matrix(df, target)
+    name_to_idx = {n: i for i, n in enumerate(all_names)}
+    col_idx = [name_to_idx[n] for n in feature_names]
+    X = X_full[:, col_idx]
+    y_pred = _gam.predict(X)
+    sigma = get_prediction_sigma(_gam, X)
+    return fit_residual_distribution(y, y_pred, sigma)
 
 
 
@@ -68,11 +95,18 @@ def main():
         return
 
     target = config["features"]["target"]
-    X, y, _ = build_feature_matrix(df, target)
+    X_full, y, all_feature_names = build_feature_matrix(df, target)
 
-    # Pre-compute predictions and sigma once (cached by Streamlit)
+    # Restrict to the columns the model was trained on (stepwise may have
+    # dropped features; saved feature_names reflects the final selection).
+    name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
+    col_idx = [name_to_idx[n] for n in feature_names]
+    X = X_full[:, col_idx]
+
+    # Pre-compute predictions, sigma, and Johnson SU distribution once
     y_pred = gam.predict(X)
     sigma = _get_sigma_from_gam(gam, X)
+    dist = build_predictive_dist(root, gam)  # cached Johnson SU fit
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     st.sidebar.header("Settings")
@@ -94,6 +128,16 @@ def main():
     fan_days = st.sidebar.slider(
         "Fan chart — days to show", min_value=60, max_value=2000,
         value=500, step=50,
+    )
+
+    # Show fitted distribution parameters in sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Predictive Distribution**")
+    st.sidebar.markdown(
+        f"Johnson SU fitted to in-sample residuals  \n"
+        f"ν = {dist.nu:.3f} (skewness)  \n"
+        f"τ = {dist.tau:.3f} (tail weight)  \n"
+        f"{'Heavier tails than Normal' if dist.tau < 1 else 'Similar/lighter tails than Normal'}"
     )
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
@@ -186,6 +230,7 @@ def main():
                 plot_fan_chart_plotly(
                     df.index, y, y_pred, gam, X,
                     last_n_days=fan_days,
+                    dist=dist,
                 ),
                 use_container_width=True,
             )
@@ -223,18 +268,24 @@ def main():
                     sigma=sigma_sel,
                     y_actual=actual_sel,
                     title=f"Predictive Distribution — {df.index[idx].date()}",
+                    dist=dist,
                 ),
                 use_container_width=True,
             )
 
-            # Summary stats for selected prediction
-            z_actual = (actual_sel - mu_sel) / sigma_sel
-            pctile = float(stats_norm_cdf(actual_sel, mu_sel, sigma_sel) * 100)
+            # Summary stats — use Johnson SU CDF when available, else Normal
+            if dist is not None:
+                pctile = float(dist.cdf(actual_sel, mu_sel, sigma_sel) * 100)
+                dist_note = f"ν={dist.nu:.2f}, τ={dist.tau:.2f}"
+            else:
+                pctile = float(stats_norm_cdf(actual_sel, mu_sel, sigma_sel) * 100)
+                dist_note = "Normal"
             st.markdown(f"""
 | Metric | Value |
 |---|---|
 | Point forecast | ${mu_sel:.2f} |
 | Pred. σ | ${sigma_sel:.2f} |
+| Distribution | {dist_note} |
 | Actual price | ${actual_sel:.2f} |
 | Actual percentile | {pctile:.1f}th |
 """)
@@ -301,7 +352,10 @@ def main():
             with col_chart:
                 st.markdown("#### Price vs Feature")
                 st.plotly_chart(
-                    plot_what_if_analysis(gam, base_X, feat_idx, vary_range, whatif_feature),
+                    plot_what_if_analysis(
+                        gam, base_X, feat_idx, vary_range, whatif_feature,
+                        dist=dist,
+                    ),
                     use_container_width=True,
                 )
 
@@ -312,6 +366,7 @@ def main():
                         mu=current_pred,
                         sigma=current_sigma,
                         title=f"Forecast Distribution\n({whatif_feature} = {current_val:.3f})",
+                        dist=dist,
                     ),
                     use_container_width=True,
                 )
@@ -323,10 +378,16 @@ def main():
                 val = current_val * (1 + pct) if pct != 0.0 else current_val
                 X_s = base_X.copy()
                 X_s[0, feat_idx] = val
-                p = gam.predict(X_s)[0]
+                p = float(gam.predict(X_s)[0])
                 sig = float(_get_sigma_from_gam(gam, X_s)[0])
+                if dist is not None:
+                    lo95 = dist.ppf(0.025, p, sig)
+                    hi95 = dist.ppf(0.975, p, sig)
+                    pi_str = f"95% PI: ${lo95:.1f}–${hi95:.1f}"
+                else:
+                    pi_str = f"σ=${sig:.2f}"
                 label = f"{'+' if pct > 0 else ''}{int(pct*100)}%  ({val:.2f})" if pct != 0 else "Current"
-                col.metric(label, f"${p:.2f}", f"σ=${sig:.2f}")
+                col.metric(label, f"${p:.2f}", pi_str)
 
 
 # ── Helper imported inline to avoid circular deps ────────────────────────────

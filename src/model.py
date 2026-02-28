@@ -15,10 +15,11 @@ logger = logging.getLogger(__name__)
 
 # Feature name patterns mapped to pyGAM term types
 MACRO_PATTERNS = ("usd_index", "cpi", "fed_funds", "t10y2y")
-CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year")
-ROLLING_PATTERNS = ("_sma_", "_std_")
+CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
+ROLLING_PATTERNS = ("_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_")
 LAG_PATTERNS = ("_lag_",)
 RETURN_PATTERNS = ("_pct_change", "_log_return")
+SPREAD_PATTERNS = ("_spread", "_ratio", "_dist_sma", "_pct_range", "_52w")
 
 
 def build_feature_matrix(
@@ -77,6 +78,8 @@ def _classify_feature(name: str) -> str:
         return "lag"
     if any(p in name_lower for p in RETURN_PATTERNS):
         return "return"
+    if any(p in name_lower for p in SPREAD_PATTERNS):
+        return "spline"
     return "spline"  # default
 
 

@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import Generator
 
 import joblib
 import numpy as np
@@ -143,6 +144,59 @@ def define_gam_terms(
     return terms
 
 
+class EmbargoedTimeSeriesSplit:
+    """Time series cross-validator with embargo gap (Lopez de Prado, 2018).
+
+    Rolling and lagged features computed on the full dataset cause data leakage
+    at each train/test boundary: e.g., a 200-day SMA for the first test
+    observation contains 199 days from the training period.
+
+    Solution: drop `embargo_days` observations from the **start** of each
+    test fold, ensuring the test set only begins after rolling-window memory
+    has fully expired.  `embargo_days` should equal the largest rolling window
+    used during feature engineering (default 200).
+
+    Args:
+        n_splits: Number of CV folds (passed to TimeSeriesSplit).
+        embargo_days: Observations to skip at the start of each test fold.
+            Set this to the maximum rolling window used in feature engineering.
+    """
+
+    def __init__(self, n_splits: int = 5, embargo_days: int = 200) -> None:
+        self.n_splits = n_splits
+        self.embargo_days = embargo_days
+
+    def split(
+        self, X: np.ndarray, y=None, groups=None
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        for fold_num, (train_idx, test_idx) in enumerate(tscv.split(X), start=1):
+            # The embargo cutoff: first index that is truly independent of training
+            # Train ends at train_idx[-1]; embargo extends embargo_days beyond that.
+            embargo_cutoff = train_idx[-1] + self.embargo_days
+            test_idx_clean = test_idx[test_idx > embargo_cutoff]
+
+            n_dropped = len(test_idx) - len(test_idx_clean)
+            if n_dropped:
+                logger.debug(
+                    f"  Fold {fold_num}: dropped {n_dropped} embargoed test obs "
+                    f"(embargo_days={self.embargo_days})"
+                )
+
+            if len(test_idx_clean) == 0:
+                logger.warning(
+                    f"  Fold {fold_num}: 0 test observations remain after "
+                    f"{self.embargo_days}-day embargo — skipping fold. "
+                    "Consider reducing embargo_days or increasing cv_splits."
+                )
+                continue
+
+            yield train_idx, test_idx_clean
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        return self.n_splits
+
+
 def fit_gam(
     X: np.ndarray,
     y: np.ndarray,
@@ -177,28 +231,45 @@ def cross_validate(
     y: np.ndarray,
     terms: object,
     n_splits: int = 5,
+    embargo_days: int = 200,
     lam_values: list[float] | None = None,
 ) -> dict:
-    """Perform time series cross-validation.
+    """Perform embargoed time series cross-validation.
 
-    Uses TimeSeriesSplit to ensure we always predict future from past.
+    Uses :class:`EmbargoedTimeSeriesSplit` to ensure that:
+    1. We always predict future from past (no temporal leakage).
+    2. Rolling/lag features computed on the full dataset do not bleed
+       training-period information into test observations at fold boundaries.
 
     Args:
         X: Feature matrix.
         y: Target vector.
         terms: pyGAM terms expression.
         n_splits: Number of CV folds.
+        embargo_days: Observations to strip from the start of each test fold.
+            Should equal the largest rolling window used in feature engineering
+            (default 200 = the 200-day SMA window).
         lam_values: Lambda values for grid search.
 
     Returns:
-        Dict with fold_metrics, mean_mae, mean_rmse, mean_mape.
+        Dict with fold_metrics, mean_mae, mean_rmse, mean_mape, embargo_days.
     """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    splitter = EmbargoedTimeSeriesSplit(n_splits=n_splits, embargo_days=embargo_days)
     fold_metrics = []
 
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+    logger.info(
+        f"Starting {n_splits}-fold embargoed CV "
+        f"(embargo_days={embargo_days}, ~{embargo_days} obs stripped per fold)"
+    )
+
+    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
+
+        logger.info(
+            f"  Fold {fold}: train={len(train_idx)} obs, "
+            f"test={len(test_idx)} obs (after embargo)"
+        )
 
         gam = fit_gam(X_train, y_train, terms, lam_values)
         y_pred = gam.predict(X_test)
@@ -207,20 +278,34 @@ def cross_validate(
         rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
         mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
 
-        fold_metrics.append({"fold": fold + 1, "mae": mae, "rmse": rmse, "mape": mape})
+        fold_metrics.append({
+            "fold": fold,
+            "train_size": len(train_idx),
+            "test_size": len(test_idx),
+            "mae": mae,
+            "rmse": rmse,
+            "mape": mape,
+        })
         logger.info(
-            f"  Fold {fold + 1}: MAE={mae:.2f}, RMSE={rmse:.2f}, MAPE={mape:.2f}%"
+            f"  Fold {fold}: MAE={mae:.2f}, RMSE={rmse:.2f}, MAPE={mape:.2f}%"
+        )
+
+    if not fold_metrics:
+        raise RuntimeError(
+            "All CV folds were skipped — no test observations survived the embargo. "
+            "Reduce embargo_days in config or increase the dataset size."
         )
 
     results = {
         "fold_metrics": fold_metrics,
-        "mean_mae": np.mean([m["mae"] for m in fold_metrics]),
-        "mean_rmse": np.mean([m["rmse"] for m in fold_metrics]),
-        "mean_mape": np.mean([m["mape"] for m in fold_metrics]),
+        "mean_mae": float(np.mean([m["mae"] for m in fold_metrics])),
+        "mean_rmse": float(np.mean([m["rmse"] for m in fold_metrics])),
+        "mean_mape": float(np.mean([m["mape"] for m in fold_metrics])),
+        "embargo_days": embargo_days,
     }
 
     logger.info(
-        f"CV Results — MAE: {results['mean_mae']:.2f}, "
+        f"CV Results (embargoed) — MAE: {results['mean_mae']:.2f}, "
         f"RMSE: {results['mean_rmse']:.2f}, "
         f"MAPE: {results['mean_mape']:.2f}%"
     )
@@ -285,6 +370,7 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
     cv_results = cross_validate(
         X, y, terms,
         n_splits=model_cfg.get("cv_splits", 5),
+        embargo_days=model_cfg.get("embargo_days", 200),
         lam_values=model_cfg.get("lam_search"),
     )
 

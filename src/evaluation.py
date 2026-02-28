@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from src.config_loader import get_project_root
 from src.model import build_feature_matrix, load_model
@@ -340,6 +342,247 @@ def plot_actual_vs_predicted(
 
 
 # ─────────────────────────────────────────────
+# Advanced Residual Diagnostics
+# ─────────────────────────────────────────────
+
+def test_residual_white_noise(
+    residuals: np.ndarray,
+    lags: int = 40,
+) -> pd.DataFrame:
+    """Ljung-Box white-noise test on model residuals.
+
+    Tests H₀: the residuals are independently distributed (white noise).
+    A significant p-value (< 0.05) indicates unexplained autocorrelation,
+    which may signal missing features or model mis-specification.
+
+    Args:
+        residuals: Array of (y_true - y_pred) values.
+        lags: Number of lags to test.
+
+    Returns:
+        DataFrame with columns ['lb_stat', 'lb_pvalue'] indexed by lag.
+    """
+    lb_result = acorr_ljungbox(residuals, lags=lags, return_df=True)
+    # Standardise column names across statsmodels versions
+    lb_result.columns = ["lb_stat", "lb_pvalue"]
+    lb_result.index.name = "lag"
+
+    n_sig = (lb_result["lb_pvalue"] < 0.05).sum()
+    logger.info(
+        f"Ljung-Box test ({lags} lags): {n_sig}/{lags} lags significant at p<0.05"
+    )
+    if n_sig == 0:
+        logger.info("  -> Residuals appear consistent with white noise (good).")
+    else:
+        logger.warning(
+            f"  -> {n_sig} significant lags detected. "
+            "The model may be leaving autocorrelated structure in the residuals."
+        )
+
+    return lb_result
+
+
+def plot_ljung_box(
+    residuals: np.ndarray,
+    lags: int = 40,
+    save_path: str | Path = "outputs/figures/ljung_box.png",
+) -> None:
+    """Bar chart of Ljung-Box p-values by lag.
+
+    Bars are green when p ≥ 0.05 (fail to reject white noise) and red when
+    p < 0.05 (significant autocorrelation detected).  The dashed horizontal
+    line marks the α = 0.05 significance threshold.
+
+    Args:
+        residuals: Array of model residuals.
+        lags: Number of lags to display.
+        save_path: Output file path.
+    """
+    lb_result = test_residual_white_noise(residuals, lags=lags)
+    pvalues = lb_result["lb_pvalue"].values
+    lag_labels = lb_result.index.values
+
+    colors = ["#d62728" if p < 0.05 else "#2ca02c" for p in pvalues]
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.bar(lag_labels, pvalues, color=colors, edgecolor="none", width=0.7)
+    ax.axhline(y=0.05, color="black", linestyle="--", linewidth=1.0,
+               label="α = 0.05 threshold")
+    ax.set_xlabel("Lag")
+    ax.set_ylabel("p-value")
+    ax.set_title("Ljung-Box White-Noise Test — Residual p-values by Lag\n"
+                 "(Green = white noise, Red = significant autocorrelation)")
+    ax.set_ylim(0, max(pvalues.max() * 1.1, 0.12))
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved Ljung-Box plot to {save_path}")
+
+
+def plot_residual_acf_pacf(
+    residuals: np.ndarray,
+    lags: int = 60,
+    save_path: str | Path = "outputs/figures/residual_acf_pacf.png",
+) -> None:
+    """ACF and PACF of model residuals.
+
+    If residuals are true white noise there should be no significant spikes
+    (outside the ±1.96/√n confidence bounds) at any lag.
+
+    Args:
+        residuals: Array of model residuals.
+        lags: Number of lags to show.
+        save_path: Output file path.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    plot_acf(residuals, lags=lags, ax=axes[0], zero=False,
+             title="ACF of Residuals", alpha=0.05)
+    plot_pacf(residuals, lags=lags, ax=axes[1], zero=False,
+              title="PACF of Residuals", alpha=0.05, method="ywm")
+
+    for ax in axes:
+        ax.axhline(y=0, color="black", linewidth=0.8)
+        ax.grid(True, alpha=0.25)
+        ax.set_xlabel("Lag")
+
+    fig.suptitle(
+        "Residual Autocorrelation — white noise ⟹ no spikes outside shaded band",
+        fontsize=12,
+    )
+    fig.tight_layout()
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved residual ACF/PACF plot to {save_path}")
+
+
+# ─────────────────────────────────────────────
+# GAM-Specific Diagnostics
+# ─────────────────────────────────────────────
+
+def print_gam_statistics(gam) -> None:
+    """Log and print the key pyGAM model statistics."""
+    stats_dict = gam.statistics_
+    lines = [
+        "",
+        "=== GAM Model Statistics ===",
+        f"  GCV score       : {stats_dict.get('GCV', float('nan')):.6f}",
+        f"  AIC             : {stats_dict.get('AIC', float('nan')):.4f}",
+        f"  AICc            : {stats_dict.get('AICc', float('nan')):.4f}",
+        f"  Pseudo R²       : {stats_dict.get('pseudo_r2', {}).get('explained_deviance', float('nan')):.4f}",
+        f"  Scale (σ²)      : {stats_dict.get('scale', float('nan')):.4f}",
+        f"  N (observations): {stats_dict.get('n_samples', 'N/A')}",
+        "",
+    ]
+    output = "\n".join(lines)
+    print(output)
+    logger.info(output)
+
+
+def plot_gam_term_diagnostics(
+    gam,
+    feature_names: list[str],
+    save_path: str | Path = "outputs/figures/gam_term_diagnostics.png",
+) -> None:
+    """Two-panel bar chart: smoothing λ and effective DoF per GAM term.
+
+    **Lambda (λ)**: The smoothing penalty. A large λ forces a near-linear term;
+    a small λ allows more flexibility. Comparing λ values across features shows
+    which features the GAM smoothed heavily (low flexibility) vs. loosely.
+
+    **Effective Degrees of Freedom (EDoF)**: The degrees of freedom consumed by
+    each spline term. EDoF ≈ 1 means the term is essentially linear; higher
+    values indicate more curvature.  The sum of all EDoFs plus the intercept
+    equals the total model complexity.
+
+    Args:
+        gam: Fitted LinearGAM (must have .statistics_ populated by gridsearch).
+        feature_names: Feature column names (length must match number of terms).
+        save_path: Output file path.
+    """
+    stats_dict = gam.statistics_
+    edof_per_term = stats_dict.get("edof_per_term", [])
+    p_values = stats_dict.get("p_values", [])
+
+    # gam.lam is a list of λ values, one per term
+    lam_values = np.array(gam.lam).flatten()
+
+    n_terms = len(feature_names)
+
+    # Guard: align lengths (intercept adds an extra term in some pyGAM versions)
+    lam_plot = lam_values[:n_terms] if len(lam_values) >= n_terms else lam_values
+    edof_plot = (
+        np.array(edof_per_term[:n_terms])
+        if len(edof_per_term) >= n_terms
+        else np.array(edof_per_term)
+    )
+    pval_plot = (
+        np.array(p_values[:n_terms])
+        if len(p_values) >= n_terms
+        else np.array(p_values)
+    )
+
+    x = np.arange(len(feature_names))
+    short_names = [
+        n if len(n) <= 22 else f"...{n[-19:]}" for n in feature_names
+    ]
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(16, n_terms * 0.35), 10))
+
+    # ── Panel 1: Smoothing Lambda ────────────────────────────────────────────
+    ax = axes[0]
+    bar_colors_lam = ["#2171b5"] * len(lam_plot)
+    bars = ax.bar(x[: len(lam_plot)], np.log10(lam_plot + 1e-10),
+                  color=bar_colors_lam, edgecolor="none", width=0.7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(short_names, rotation=75, ha="right", fontsize=7)
+    ax.set_ylabel("log₁₀(λ)  [higher = smoother]")
+    ax.set_title("Smoothing Penalty λ per GAM Term  (larger = less flexible)")
+    ax.grid(True, axis="y", alpha=0.3)
+
+    # ── Panel 2: Effective Degrees of Freedom ────────────────────────────────
+    ax2 = axes[1]
+    if len(edof_plot) > 0:
+        # Colour by significance (p_values): red if significant, blue otherwise
+        if len(pval_plot) == len(edof_plot):
+            bar_colors_edof = [
+                "#d62728" if p < 0.05 else "#2171b5" for p in pval_plot
+            ]
+        else:
+            bar_colors_edof = ["#2171b5"] * len(edof_plot)
+
+        ax2.bar(x[: len(edof_plot)], edof_plot,
+                color=bar_colors_edof, edgecolor="none", width=0.7)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(short_names, rotation=75, ha="right", fontsize=7)
+        ax2.set_ylabel("Effective Degrees of Freedom")
+        ax2.set_title(
+            "Effective DoF per Term  "
+            "(EDoF≈1 ⟹ near-linear | Red = significant p < 0.05)"
+        )
+        ax2.axhline(y=1, color="black", linestyle="--", linewidth=0.8,
+                    label="EDoF = 1 (linear)")
+        ax2.legend(fontsize=8)
+        ax2.grid(True, axis="y", alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, "EDoF not available (run gridsearch first)",
+                 ha="center", va="center", transform=ax2.transAxes)
+
+    fig.tight_layout()
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved GAM term diagnostics to {save_path}")
+
+
+# ─────────────────────────────────────────────
 # Pipeline Orchestrator
 # ─────────────────────────────────────────────
 
@@ -353,21 +596,27 @@ def run_evaluation(config: dict) -> pd.DataFrame:
     target = config["features"]["target"]
     gam = load_model(root / "outputs" / "models" / "gam_model.pkl")
 
-    X, y, _ = build_feature_matrix(df, target)
+    X, y, feature_names = build_feature_matrix(df, target)
 
     y_gam = gam.predict(X)
     y_naive = naive_baseline_predictions(y)
+    residuals = y - y_gam
 
+    # ── Metrics comparison ────────────────────────────────────────────────────
     comparison = compare_with_baseline(y, y_gam, y_naive)
     logger.info(f"\nModel Comparison:\n{comparison.to_string()}")
     print("\n=== Model Comparison ===")
     print(comparison.to_string())
     print()
 
-    # Standard plots
+    # ── GAM model-level statistics ────────────────────────────────────────────
+    print_gam_statistics(gam)
+
+    # ── Standard plots ────────────────────────────────────────────────────────
     plot_actual_vs_predicted(df.index, y, y_gam, fig_dir / "actual_vs_pred.png")
     plot_residual_diagnostics(y, y_gam, fig_dir / "residuals.png")
 
+    # ── Probability forecast plots ────────────────────────────────────────────
     # Fan chart (last 500 trading days)
     plot_fan_chart(df.index, y, y_gam, gam, X,
                    save_path=fig_dir / "fan_chart.png")
@@ -381,5 +630,18 @@ def run_evaluation(config: dict) -> pd.DataFrame:
         save_path=fig_dir / "predictive_density.png",
         title="Predictive Distribution — Most Recent Observation",
     )
+
+    # ── Advanced residual diagnostics ─────────────────────────────────────────
+    # Ljung-Box white-noise test (table printed via logger inside function)
+    lb_results = test_residual_white_noise(residuals, lags=40)
+    plot_ljung_box(residuals, lags=40, save_path=fig_dir / "ljung_box.png")
+
+    # ACF / PACF of residuals
+    plot_residual_acf_pacf(residuals, lags=60,
+                           save_path=fig_dir / "residual_acf_pacf.png")
+
+    # ── GAM term-level diagnostics ────────────────────────────────────────────
+    plot_gam_term_diagnostics(gam, feature_names,
+                              save_path=fig_dir / "gam_term_diagnostics.png")
 
     return comparison

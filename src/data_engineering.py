@@ -19,6 +19,7 @@ def merge_datasets(
     oil_df: pd.DataFrame,
     fred_df: pd.DataFrame,
     eia_dfs: dict[str, pd.DataFrame],
+    market_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Merge all data sources on date index.
 
@@ -27,17 +28,19 @@ def merge_datasets(
     weekends/holidays across sources.
 
     Args:
-        oil_df: Daily oil price data.
+        oil_df: Daily oil OHLCV data (WTI + Brent).
         fred_df: Daily/irregular FRED macro data.
-        eia_dfs: Dict of EIA DataFrames (e.g., {"crude_stocks": df, "production": df}).
+        eia_dfs: Dict of EIA DataFrames with weekly/monthly frequency.
+        market_df: Optional DataFrame of broad market close prices
+            (currencies, commodities, equities, yield indices).
 
     Returns:
-        Merged DataFrame with daily frequency and no gaps.
+        Merged DataFrame with daily frequency and no gaps in the oil series.
     """
     # Start with oil prices as the base (daily trading days)
     merged = oil_df.copy()
 
-    # Join FRED data
+    # Join FRED data (left join — FRED may have gaps on weekends)
     merged = merged.join(fred_df, how="left")
 
     # Resample EIA data to daily and join
@@ -46,11 +49,15 @@ def merge_datasets(
         eia_daily = eia_renamed.resample("D").ffill()
         merged = merged.join(eia_daily, how="left")
 
-    # Forward-fill remaining NaN from holidays/weekends
+    # Join broad market data (already daily, but may have NaN on holidays)
+    if market_df is not None and not market_df.empty:
+        merged = merged.join(market_df, how="left")
+
+    # Forward-fill remaining NaN from weekends / different trading calendars
     merged = merged.ffill()
 
-    # Drop rows where we still have no data at all
-    merged = merged.dropna()
+    # Drop rows where core oil data is still missing
+    merged = merged.dropna(subset=oil_df.columns.tolist())
 
     logger.info(f"Merged dataset: {merged.shape[0]} rows, {merged.shape[1]} columns")
     return merged
@@ -313,6 +320,59 @@ def add_spread_features(
     return df
 
 
+def add_crack_spread_features(
+    df: pd.DataFrame,
+    wti_col: str,
+    gasoline_col: str | None = None,
+    heating_oil_col: str | None = None,
+) -> pd.DataFrame:
+    """Compute refinery crack spreads.
+
+    Crack spreads measure the margin between crude oil input costs and
+    refined product prices. When margins are high, refineries ramp up
+    crude purchases, creating upward demand pressure on the crude price.
+
+    Gasoline and heating oil futures are quoted in USD/gallon.
+    Crude oil is quoted in USD/barrel.  1 barrel = 42 gallons, so:
+
+        Gasoline crack ($/bbl) = gasoline_close × 42 − wti_close
+        Heating oil crack ($/bbl) = heating_oil_close × 42 − wti_close
+
+    The 3-2-1 crack spread is the industry benchmark:
+        3-2-1 = (2 × gasoline + 1 × heating_oil) × 42 / 3  −  wti_close
+
+    Args:
+        df: Input DataFrame.
+        wti_col: WTI crude close price column (USD/bbl).
+        gasoline_col: RBOB gasoline close price column (USD/gal), or None.
+        heating_oil_col: Heating oil close price column (USD/gal), or None.
+
+    Returns:
+        DataFrame with crack spread columns added.
+    """
+    GALLONS_PER_BARREL = 42.0
+
+    if gasoline_col and gasoline_col in df.columns:
+        gasoline_bbl = df[gasoline_col] * GALLONS_PER_BARREL
+        df["crack_gasoline"] = gasoline_bbl - df[wti_col]
+        df["crack_gasoline_sma_14"] = df["crack_gasoline"].rolling(14, min_periods=14).mean()
+
+    if heating_oil_col and heating_oil_col in df.columns:
+        ho_bbl = df[heating_oil_col] * GALLONS_PER_BARREL
+        df["crack_heating_oil"] = ho_bbl - df[wti_col]
+        df["crack_heating_oil_sma_14"] = df["crack_heating_oil"].rolling(14, min_periods=14).mean()
+
+    if (gasoline_col and gasoline_col in df.columns
+            and heating_oil_col and heating_oil_col in df.columns):
+        gasoline_bbl = df[gasoline_col] * GALLONS_PER_BARREL
+        ho_bbl = df[heating_oil_col] * GALLONS_PER_BARREL
+        df["crack_3_2_1"] = (2 * gasoline_bbl + ho_bbl) / 3 - df[wti_col]
+        df["crack_3_2_1_sma_14"] = df["crack_3_2_1"].rolling(14, min_periods=14).mean()
+        logger.info("Computed gasoline, heating-oil, and 3-2-1 crack spreads")
+
+    return df
+
+
 def add_price_level_features(
     df: pd.DataFrame,
     target_col: str,
@@ -393,10 +453,16 @@ def build_features(config: dict) -> pd.DataFrame:
         if eia_path.exists():
             eia_dfs[name] = pd.read_parquet(eia_path)
 
+    market_df = None
+    market_path = raw_dir / "market_tickers.parquet"
+    if market_path.exists():
+        market_df = pd.read_parquet(market_path)
+        logger.info(f"Loaded market data: {list(market_df.columns)}")
+
     logger.info(f"Oil price columns: {list(oil_df.columns)}")
 
     # ── Merge ─────────────────────────────────────────
-    df = merge_datasets(oil_df, fred_df, eia_dfs)
+    df = merge_datasets(oil_df, fred_df, eia_dfs, market_df)
     logger.info(f"Merged columns: {list(df.columns)}")
 
     # ── Resolve target column (case-insensitive) ──────
@@ -426,37 +492,67 @@ def build_features(config: dict) -> pd.DataFrame:
     wti_col = close_cols.get("CL=F")
     brent_col = close_cols.get("BZ=F")
 
-    # Macro columns for exogenous lags
-    macro_cols = [c for c in ["usd_index", "cpi", "fed_funds", "t10y2y"] if c in df.columns]
+    # Macro columns for exogenous lags (FRED + yield indices from market data)
+    macro_cols = [
+        c for c in [
+            "usd_index", "cpi", "fed_funds", "t10y2y",
+            "t3m_yield_close", "t5y_yield_close",
+            "t10y_yield_close", "t30y_yield_close",
+        ]
+        if c in df.columns
+    ]
+
+    # All close columns from market tickers (for returns + lags)
+    market_close_cols = [c for c in df.columns if c.endswith("_close") and c != target_col]
+
+    # Crack spread constituent columns
+    gasoline_col = "gasoline_close" if "gasoline_close" in df.columns else None
+    heating_oil_col = "heating_oil_close" if "heating_oil_close" in df.columns else None
 
     # ── Feature Engineering ───────────────────────────
     # 1. Autoregressive lags: t-1, t-3, t-7, t-30
     df = add_lag_features(df, target_col, [1, 3, 7, 30])
 
-    # 2. Exogenous lags (macro impact is delayed)
+    # 2. Exogenous lags (macro + yield impact is delayed)
     df = add_exogenous_lags(df, macro_cols, lags=[7, 14])
 
-    # 3. Rolling SMAs, EMAs, and volatility: 14, 50, 200 days
+    # 3. Key market lags (energy commodities and currencies move together with crude)
+    market_lag_cols = [
+        c for c in market_close_cols
+        if any(k in c for k in [
+            "nat_gas", "gasoline", "heating_oil",
+            "eur_usd", "usd_cad", "usd_nok", "usd_rub",
+            "gold", "copper", "sp500",
+        ])
+    ]
+    df = add_exogenous_lags(df, market_lag_cols, lags=[1, 7])
+
+    # 4. Rolling SMAs, EMAs, and volatility: 14, 50, 200 days
     df = add_rolling_features(df, target_col, [14, 50, 200])
 
-    # 4. Bollinger Bands (20-day, 2 std)
+    # 5. Bollinger Bands (20-day, 2 std)
     df = add_bollinger_bands(df, target_col, window=20, n_std=2.0)
 
-    # 5. Momentum: RSI(14), MACD(12,26,9)
+    # 6. Momentum: RSI(14), MACD(12,26,9)
     df = add_momentum_features(df, target_col, rsi_period=14)
 
-    # 6. Price level features (needs MAs to be computed first)
+    # 7. Price level features (needs MAs to be computed first)
     df = add_price_level_features(df, target_col)
 
-    # 7. Calendar features
+    # 8. Calendar features
     df = add_calendar_features(df)
 
-    # 8. Returns and log-returns for all close prices
-    df = add_return_features(df, list(close_cols.values()))
+    # 9. Returns and log-returns — oil close prices + market close prices
+    all_return_cols = list(close_cols.values()) + market_close_cols
+    df = add_return_features(df, all_return_cols)
 
-    # 9. Brent–WTI spread
+    # 10. Brent–WTI spread
     if wti_col and brent_col:
         df = add_spread_features(df, wti_col, brent_col)
+
+    # 11. Crack spreads (refinery margin proxies for crude demand)
+    if wti_col:
+        df = add_crack_spread_features(df, wti_col, gasoline_col, heating_oil_col)
 
     # ── Drop warm-up NaN rows ─────────────────────────
     before = len(df)

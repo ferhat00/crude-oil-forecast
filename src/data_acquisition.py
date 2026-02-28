@@ -176,6 +176,83 @@ def fetch_eia_data(
     return df
 
 
+def fetch_market_tickers(
+    ticker_map: dict[str, str],
+    start: str,
+    end: str | None = None,
+    save_path: Path | None = None,
+) -> pd.DataFrame:
+    """Download daily close prices for a broad set of market instruments.
+
+    Handles currencies, energy commodities, equities, ETFs, and yield indices
+    in a single yfinance batch call.  Only the adjusted Close price is kept —
+    OHLCV is not needed for these exogenous signals.
+
+    Args:
+        ticker_map: Dict mapping descriptive name → Yahoo Finance ticker.
+            e.g., {"nat_gas": "NG=F", "sp500": "^GSPC", "eur_usd": "EURUSD=X"}
+        start: Start date string (YYYY-MM-DD).
+        end: End date string or None for today.
+        save_path: If given, saves result as parquet.
+
+    Returns:
+        DataFrame with DatetimeIndex and columns named ``{name}_close``.
+        Tickers that fail to download are logged and skipped.
+    """
+    names = list(ticker_map.keys())
+    tickers = list(ticker_map.values())
+    logger.info(
+        f"Fetching {len(tickers)} market tickers from {start} to {end or 'today'}"
+    )
+
+    # Case-insensitive lookup: yfinance-lowercased ticker → original ticker
+    ticker_lower_to_orig = {t.lower(): t for t in tickers}
+    ticker_to_name = {t: n for n, t in ticker_map.items()}
+
+    data = yf.download(tickers, start=start, end=end, auto_adjust=True)
+
+    if data.empty:
+        logger.warning("No market data returned from yfinance — skipping.")
+        return pd.DataFrame()
+
+    # Extract Close prices only from the (field, ticker) MultiIndex
+    if isinstance(data.columns, pd.MultiIndex):
+        close_df = data["Close"].copy()
+    else:
+        # Single-ticker fallback
+        close_df = data[["Close"]].copy()
+        close_df.columns = [tickers[0]]
+
+    # Rename columns: yfinance-altered ticker → "{descriptive_name}_close"
+    rename_map = {}
+    for col in close_df.columns:
+        orig_ticker = ticker_lower_to_orig.get(str(col).lower(), str(col))
+        desc_name = ticker_to_name.get(orig_ticker, orig_ticker)
+        rename_map[col] = f"{desc_name}_close"
+    close_df = close_df.rename(columns=rename_map)
+
+    close_df.index = pd.to_datetime(close_df.index)
+    close_df.index.name = "date"
+
+    for col in close_df.columns:
+        n_valid = close_df[col].notna().sum()
+        n_total = len(close_df)
+        if n_valid < 0.5 * n_total:
+            logger.warning(f"  {col}: sparse — only {n_valid}/{n_total} valid rows")
+        else:
+            logger.info(f"  {col}: {n_valid} valid rows")
+
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        close_df.to_parquet(save_path)
+        logger.info(
+            f"Saved market data to {save_path} "
+            f"({len(close_df)} rows, {len(close_df.columns)} series)"
+        )
+
+    return close_df
+
+
 def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
     """Run all data acquisition steps.
 
@@ -183,7 +260,7 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
         config: Project configuration dictionary.
 
     Returns:
-        Dict with keys 'oil', 'fred', and one key per EIA series.
+        Dict with keys 'oil', 'fred', 'market', and one key per EIA series.
     """
     root = get_project_root(config)
     raw_dir = root / "data" / "raw"
@@ -192,7 +269,7 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
     end = data_cfg.get("end_date")
     result = {}
 
-    # Oil prices
+    # Oil prices (WTI + Brent, full OHLCV)
     result["oil"] = fetch_oil_prices(
         tickers=data_cfg["oil_tickers"],
         start=start,
@@ -218,6 +295,16 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
             api_key=api_key,
             series_id=series_id,
             save_path=raw_dir / f"eia_{name}.parquet",
+        )
+
+    # Broad market tickers (currencies, commodities, equities, rates)
+    market_tickers = config.get("market_tickers", {})
+    if market_tickers:
+        result["market"] = fetch_market_tickers(
+            ticker_map=market_tickers,
+            start=start,
+            end=end,
+            save_path=raw_dir / "market_tickers.parquet",
         )
 
     logger.info(f"Data acquisition complete. Datasets: {list(result.keys())}")

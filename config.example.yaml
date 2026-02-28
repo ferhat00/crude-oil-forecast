@@ -1,0 +1,74 @@
+eia:
+  api_key: "YOUR_EIA_API_KEY"
+  base_url: "https://api.eia.gov/v2"
+
+fred:
+  api_key: "YOUR_FRED_API_KEY"
+
+data:
+  start_date: "2015-01-01"
+  end_date: null  # null means today
+  oil_tickers:
+    - "CL=F"  # WTI crude (target)
+    - "BZ=F"  # Brent crude
+  fred_series:
+    usd_index: "DTWEXBGS"       # Trade Weighted US Dollar Index: Broad, Goods
+    cpi: "CPIAUCSL"             # Consumer Price Index
+    fed_funds: "DFF"            # Federal Funds Effective Rate
+    t10y2y: "T10Y2Y"            # 10-Year minus 2-Year Treasury spread
+  eia_series:
+    crude_stocks: "PET.WTTSTUS1.W"    # Weekly U.S. Ending Stocks of Crude Oil
+    production: "PET.MCRFPUS2.M"      # U.S. Field Production of Crude Oil
+
+market_tickers:
+  # ── Currencies (USD vs oil-relevant economies) ──────────────────────────────
+  usd_index_yf: "DX-Y.NYB"    # US Dollar Index (ICE)
+  eur_usd:      "EURUSD=X"    # Euro / USD
+  gbp_usd:      "GBPUSD=X"    # British Pound / USD
+  usd_cad:      "USDCAD=X"    # USD / Canadian Dollar (petrocurrency)
+  usd_nok:      "USDNOK=X"    # USD / Norwegian Krone (petrocurrency)
+  usd_rub:      "USDRUB=X"    # USD / Russian Ruble
+  usd_cny:      "USDCNY=X"    # USD / Chinese Renminbi
+  aud_usd:      "AUDUSD=X"    # Australian Dollar / USD (commodity currency)
+  nzd_usd:      "NZDUSD=X"    # New Zealand Dollar / USD
+  usd_chf:      "USDCHF=X"    # USD / Swiss Franc (safe-haven proxy)
+  # ── Energy commodities ───────────────────────────────────────────────────────
+  nat_gas:      "NG=F"        # Henry Hub Natural Gas Futures
+  gasoline:     "RB=F"        # RBOB Gasoline Futures ($/gallon)
+  heating_oil:  "HO=F"        # Heating Oil Futures ($/gallon)
+  # ── Energy equities & ETFs ──────────────────────────────────────────────────
+  xle:          "XLE"         # Energy Select Sector SPDR (broad sector)
+  oih:          "OIH"         # VanEck Oil Services ETF (drilling/services)
+  xop:          "XOP"         # SPDR S&P Oil & Gas Exploration ETF
+  xom:          "XOM"         # ExxonMobil
+  cvx:          "CVX"         # Chevron
+  bp:           "BP"          # BP plc (ADR)
+  cop:          "COP"         # ConocoPhillips
+  shel:         "SHEL"        # Shell plc (ADR)
+  # ── Macro demand proxies ─────────────────────────────────────────────────────
+  sp500:        "^GSPC"       # S&P 500 — broad US economic health
+  jets:         "JETS"        # US Global Jets ETF — air travel / jet fuel demand
+  gold:         "GC=F"        # Gold Futures — inflation / risk-off proxy
+  silver:       "SI=F"        # Silver Futures
+  copper:       "HG=F"        # Copper Futures — global industrial demand
+  vix:          "^VIX"        # CBOE Volatility Index — market fear gauge
+  eem:          "EEM"         # iShares MSCI Emerging Markets ETF
+  dbc:          "DBC"         # Invesco DB Commodity Index
+  # ── Interest rates (yields) ─────────────────────────────────────────────────
+  t3m_yield:    "^IRX"        # 13-Week (3-Month) Treasury Bill yield
+  t5y_yield:    "^FVX"        # 5-Year Treasury Note yield
+  t10y_yield:   "^TNX"        # 10-Year Treasury Note yield (global benchmark)
+  t30y_yield:   "^TYX"        # 30-Year Treasury Bond yield
+
+features:
+  lag_days: [1, 3, 7, 30]           # Autoregressive lags of the target
+  exog_lag_days: [7, 14]            # Lags applied to macro/exogenous variables
+  rolling_windows: [14, 50, 200]    # Windows for SMA, EMA, and rolling volatility
+  bollinger_window: 20              # Bollinger Band window
+  rsi_period: 14                    # RSI lookback period
+  target: "CL=F_close"
+
+model:
+  n_splines: 25
+  lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
+  cv_splits: 5

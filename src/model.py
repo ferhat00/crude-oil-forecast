@@ -13,12 +13,23 @@ from src.config_loader import get_project_root
 
 logger = logging.getLogger(__name__)
 
-# Feature name patterns mapped to pyGAM term types
-MACRO_PATTERNS = ("usd_index", "cpi", "fed_funds", "t10y2y")
+# Feature name patterns → pyGAM term type
+# Linear (l): features with an expected near-linear relationship with crude price
+MACRO_PATTERNS = (
+    "usd_index", "cpi", "fed_funds", "t10y2y",
+    "t3m_yield", "t5y_yield", "t10y_yield", "t30y_yield",
+    "eur_usd", "gbp_usd", "usd_cad", "usd_nok",
+    "usd_rub", "usd_cny", "aud_usd", "nzd_usd", "usd_chf",
+)
+# Cyclic spline (s, basis='cp'): calendar features that wrap around
 CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
-ROLLING_PATTERNS = ("_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_")
+# Spline with more knots: rolling/momentum indicators
+ROLLING_PATTERNS = ("_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_", "crack_")
+# Spline: autoregressive and exogenous lags
 LAG_PATTERNS = ("_lag_",)
+# Spline: returns and log-returns
 RETURN_PATTERNS = ("_pct_change", "_log_return")
+# Spline: spread, ratio, and price-level features
 SPREAD_PATTERNS = ("_spread", "_ratio", "_dist_sma", "_pct_range", "_52w")
 
 

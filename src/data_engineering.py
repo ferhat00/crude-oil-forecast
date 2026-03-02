@@ -20,19 +20,22 @@ def merge_datasets(
     fred_df: pd.DataFrame,
     eia_dfs: dict[str, pd.DataFrame],
     market_df: pd.DataFrame | None = None,
+    cot_df: pd.DataFrame | None = None,
+    alpha_vantage_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Merge all data sources on date index.
 
-    EIA data (weekly/monthly) is resampled to daily via forward-fill before merging.
-    All DataFrames are outer-joined on date, then forward-filled to handle
-    weekends/holidays across sources.
+    EIA, COT, and Alpha Vantage data (weekly/monthly) are resampled to daily
+    via forward-fill before merging. All DataFrames are left-joined on the oil
+    price base index, then forward-filled to handle weekends/holidays.
 
     Args:
         oil_df: Daily oil OHLCV data (WTI + Brent).
         fred_df: Daily/irregular FRED macro data.
         eia_dfs: Dict of EIA DataFrames with weekly/monthly frequency.
-        market_df: Optional DataFrame of broad market close prices
-            (currencies, commodities, equities, yield indices).
+        market_df: Optional DataFrame of broad market close prices.
+        cot_df: Optional weekly CFTC COT positioning DataFrame.
+        alpha_vantage_df: Optional monthly Alpha Vantage economic indicators.
 
     Returns:
         Merged DataFrame with daily frequency and no gaps in the oil series.
@@ -52,6 +55,16 @@ def merge_datasets(
     # Join broad market data (already daily, but may have NaN on holidays)
     if market_df is not None and not market_df.empty:
         merged = merged.join(market_df, how="left")
+
+    # COT positioning data (weekly → resample to daily via ffill)
+    if cot_df is not None and not cot_df.empty:
+        cot_daily = cot_df.resample("D").ffill()
+        merged = merged.join(cot_daily, how="left")
+
+    # Alpha Vantage economic indicators (monthly → resample to daily via ffill)
+    if alpha_vantage_df is not None and not alpha_vantage_df.empty:
+        av_daily = alpha_vantage_df.resample("D").ffill()
+        merged = merged.join(av_daily, how="left")
 
     # Forward-fill remaining NaN from weekends / different trading calendars
     merged = merged.ffill()
@@ -459,10 +472,26 @@ def build_features(config: dict) -> pd.DataFrame:
         market_df = pd.read_parquet(market_path)
         logger.info(f"Loaded market data: {list(market_df.columns)}")
 
+    cot_df = None
+    cot_path = raw_dir / "cot.parquet"
+    if cot_path.exists():
+        cot_df = pd.read_parquet(cot_path)
+        logger.info(f"Loaded COT data: {len(cot_df)} rows")
+
+    alpha_vantage_df = None
+    av_path = raw_dir / "alpha_vantage.parquet"
+    if av_path.exists():
+        alpha_vantage_df = pd.read_parquet(av_path)
+        logger.info(f"Loaded Alpha Vantage data: {list(alpha_vantage_df.columns)}")
+
     logger.info(f"Oil price columns: {list(oil_df.columns)}")
 
     # ── Merge ─────────────────────────────────────────
-    df = merge_datasets(oil_df, fred_df, eia_dfs, market_df)
+    df = merge_datasets(
+        oil_df, fred_df, eia_dfs, market_df,
+        cot_df=cot_df,
+        alpha_vantage_df=alpha_vantage_df,
+    )
     logger.info(f"Merged columns: {list(df.columns)}")
 
     # ── Resolve target column (case-insensitive) ──────
@@ -516,7 +545,17 @@ def build_features(config: dict) -> pd.DataFrame:
     # 2. Exogenous lags (macro + yield impact is delayed)
     df = add_exogenous_lags(df, macro_cols, lags=[7, 14])
 
-    # 3. Key market lags (energy commodities and currencies move together with crude)
+    # 3a. COT positioning lags (positioning is a leading indicator, delayed release)
+    cot_cols = [c for c in df.columns if c.startswith("cot_")]
+    if cot_cols:
+        df = add_exogenous_lags(df, cot_cols, lags=[7, 14])
+
+    # 3b. Alpha Vantage economic indicator lags
+    av_cols = [c for c in df.columns if c.startswith("av_")]
+    if av_cols:
+        df = add_exogenous_lags(df, av_cols, lags=[7, 14])
+
+    # 3c. Key market lags (energy commodities and currencies move together with crude)
     market_lag_cols = [
         c for c in market_close_cols
         if any(k in c for k in [

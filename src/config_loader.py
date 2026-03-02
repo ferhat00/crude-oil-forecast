@@ -77,6 +77,12 @@ def load_config(path: str | None = None) -> dict:
         if env_key:
             config.setdefault("fred", {})["api_key"] = env_key
 
+    av_key = config.get("alpha_vantage", {}).get("api_key", "")
+    if not av_key or av_key.startswith("YOUR_"):
+        env_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+        if env_key:
+            config.setdefault("alpha_vantage", {})["api_key"] = env_key
+
     # Inject project root for path resolution
     config["_project_root"] = str(_find_project_root())
 
@@ -96,6 +102,20 @@ def get_fred_client(config: dict) -> Fred:
             "FRED API key not configured. Set it in config.yaml or FRED_API_KEY env var."
         )
     return Fred(api_key=api_key)
+
+
+def get_alpha_vantage_params(config: dict) -> tuple[str, str, dict[str, str]]:
+    """Return (base_url, api_key, series_map) for Alpha Vantage API calls."""
+    av = config.get("alpha_vantage", {})
+    api_key = av.get("api_key", "")
+    if not api_key or api_key.startswith("YOUR_"):
+        raise ValueError(
+            "Alpha Vantage API key not configured. "
+            "Set it in config.yaml or ALPHA_VANTAGE_API_KEY env var."
+        )
+    base_url = av.get("base_url", "https://www.alphavantage.co/query")
+    series_map = av.get("series", {})
+    return base_url, api_key, series_map
 
 
 def get_eia_params(config: dict) -> tuple[str, str]:

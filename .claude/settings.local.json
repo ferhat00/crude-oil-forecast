@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:pygam.readthedocs.io)"
+      "WebFetch(domain:pygam.readthedocs.io)",
+      "Bash(test -f /c/Users/Ferhat/Documents/GitHub/crude-oil-forecast/config.yaml)",
+      "Bash(\"crud-oil/Scripts/pip\" install cot_reports)",
+      "Bash(\"crud-oil/Scripts/python\" -c \"import cot_reports; help\\(cot_reports.cot_all\\)\")",
+      "Bash(\"crud-oil/Scripts/python\" -m pytest tests/ -v)",
+      "Bash(\"crud-oil/Scripts/pip\" install pytest -q)",
+      "Bash(\"crud-oil/Scripts/python\" -m pytest tests/test_data_engineering.py -v -k \"cot or alpha\")"
     ]
   }
 }

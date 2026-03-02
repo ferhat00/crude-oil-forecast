@@ -54,6 +54,38 @@ def sample_eia_dfs():
     }
 
 
+@pytest.fixture
+def sample_cot_df():
+    """Create CFTC COT-like weekly data."""
+    dates = pd.date_range("2023-01-06", periods=20, freq="W-FRI")
+    rng = np.random.default_rng(42)
+    mm_long = 200_000 + rng.standard_normal(20).cumsum() * 5000
+    mm_short = 100_000 + rng.standard_normal(20).cumsum() * 5000
+    return pd.DataFrame(
+        {
+            "cot_mm_long": mm_long,
+            "cot_mm_short": mm_short,
+            "cot_mm_net": mm_long - mm_short,
+            "cot_open_interest": 400_000 + rng.standard_normal(20).cumsum() * 10000,
+        },
+        index=dates,
+    )
+
+
+@pytest.fixture
+def sample_alpha_vantage_df():
+    """Create Alpha Vantage-like monthly economic indicator data."""
+    dates = pd.date_range("2023-01-01", periods=12, freq="MS")
+    rng = np.random.default_rng(42)
+    return pd.DataFrame(
+        {
+            "av_consumer_sentiment": 70 + rng.standard_normal(12) * 5,
+            "av_nonfarm_payroll": 200 + rng.standard_normal(12) * 50,
+        },
+        index=dates,
+    )
+
+
 class TestMergeDatasets:
     def test_merge_produces_daily_index(self, sample_oil_df, sample_fred_df, sample_eia_dfs):
         merged = merge_datasets(sample_oil_df, sample_fred_df, sample_eia_dfs)
@@ -69,6 +101,33 @@ class TestMergeDatasets:
     def test_merge_no_nans(self, sample_oil_df, sample_fred_df, sample_eia_dfs):
         merged = merge_datasets(sample_oil_df, sample_fred_df, sample_eia_dfs)
         assert not merged.isna().any().any()
+
+    def test_merge_includes_cot_columns(
+        self, sample_oil_df, sample_fred_df, sample_eia_dfs, sample_cot_df
+    ):
+        merged = merge_datasets(
+            sample_oil_df, sample_fred_df, sample_eia_dfs, cot_df=sample_cot_df
+        )
+        assert "cot_mm_long" in merged.columns
+        assert "cot_mm_net" in merged.columns
+
+    def test_merge_includes_alpha_vantage_columns(
+        self, sample_oil_df, sample_fred_df, sample_eia_dfs, sample_alpha_vantage_df
+    ):
+        merged = merge_datasets(
+            sample_oil_df, sample_fred_df, sample_eia_dfs,
+            alpha_vantage_df=sample_alpha_vantage_df,
+        )
+        assert "av_consumer_sentiment" in merged.columns
+        assert "av_nonfarm_payroll" in merged.columns
+
+    def test_merge_without_optional_sources(self, sample_oil_df, sample_fred_df, sample_eia_dfs):
+        """Backward compatibility: all optional args default to None."""
+        merged = merge_datasets(sample_oil_df, sample_fred_df, sample_eia_dfs)
+        cot_cols = [c for c in merged.columns if c.startswith("cot_")]
+        av_cols = [c for c in merged.columns if c.startswith("av_")]
+        assert len(cot_cols) == 0
+        assert len(av_cols) == 0
 
 
 class TestLagFeatures:

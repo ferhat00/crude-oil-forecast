@@ -29,10 +29,16 @@ data:
   eia_series:
     crude_stocks:      "PET.WTTSTUS1.W"   # Weekly U.S. Ending Stocks of Crude Oil
     production:        "PET.WCRFPUS2.W"   # Weekly U.S. Crude Oil Production
-    gasoline_stocks:   "PET.WGFUPUS2.W"   # Weekly U.S. Gasoline Stocks
+    gasoline_stocks:   "PET.WGFUPUS2.W"   # Weekly U.S. Gasoline Product Supplied (demand proxy)
     distillate_stocks: "PET.WDISTUS1.W"   # Weekly U.S. Distillate Fuel Stocks
     crude_imports:     "PET.WCRRIUS2.W"   # Weekly U.S. Crude Oil Imports
     spr:               "PET.WCRSTUS1.W"   # Weekly U.S. Strategic Petroleum Reserve
+    # ── New: supply-demand identity completers ───────────────────────────────
+    cushing_stocks:          "PET.W_EPC0_SAX_YCUOK_MBBL.W"  # Cushing OK stocks — WTI futures delivery point
+    refinery_utilization:    "PET.WPULEUS3.W"                 # U.S. refinery utilization % of operable capacity
+    crude_exports:           "PET.WCREXUS2.W"                 # U.S. crude oil exports (weekly, post-2015)
+    jet_fuel_demand:         "PET.WKJUPUS2.W"                 # Jet fuel product supplied — aviation demand proxy
+    total_products_supplied: "PET.WRPUPUS2.W"                 # Total petroleum products supplied — aggregate demand
 
 alpha_vantage:
   api_key: "YOUR_ALPHA_VANTAGE_API_KEY"  # https://www.alphavantage.co/support/#api-key

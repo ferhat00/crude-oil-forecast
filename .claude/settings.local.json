@@ -7,7 +7,9 @@
       "Bash(\"crud-oil/Scripts/python\" -c \"import cot_reports; help\\(cot_reports.cot_all\\)\")",
       "Bash(\"crud-oil/Scripts/python\" -m pytest tests/ -v)",
       "Bash(\"crud-oil/Scripts/pip\" install pytest -q)",
-      "Bash(\"crud-oil/Scripts/python\" -m pytest tests/test_data_engineering.py -v -k \"cot or alpha\")"
+      "Bash(\"crud-oil/Scripts/python\" -m pytest tests/test_data_engineering.py -v -k \"cot or alpha\")",
+      "Bash(source crud-oil/Scripts/activate)",
+      "Bash(python -c \":*)"
     ]
   }
 }

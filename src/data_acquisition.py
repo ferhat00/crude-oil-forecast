@@ -303,12 +303,14 @@ def fetch_cot_data(
     limit = 50000
     offset = 0
 
+    _market_name = "CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE"
+
     while True:
         params = {
-            "$where": "market_and_exchange_names like '%CRUDE OIL, LIGHT SWEET%'",
+            "$where": f"market_and_exchange_names='{_market_name}'",
             "$limit": limit,
             "$offset": offset,
-            "$order": "report_date_as_mm_dd_yyyy ASC",
+            "$order": "report_date_as_yyyy_mm_dd ASC",
         }
         for attempt in range(1, 4):
             try:
@@ -334,12 +336,12 @@ def fetch_cot_data(
     df = pd.DataFrame(all_records)
 
     col_map = {
-        "report_date_as_mm_dd_yyyy": "date",
+        "report_date_as_yyyy_mm_dd": "date",
         "open_interest_all": "cot_open_interest",
-        "prod_merc_positions_long_all": "cot_commercial_long",
-        "prod_merc_positions_short_all": "cot_commercial_short",
-        "money_manager_positions_long_all": "cot_mm_long",
-        "money_manager_positions_short_all": "cot_mm_short",
+        "prod_merc_positions_long": "cot_commercial_long",
+        "prod_merc_positions_short": "cot_commercial_short",
+        "m_money_positions_long_all": "cot_mm_long",
+        "m_money_positions_short_all": "cot_mm_short",
     }
     present = {k: v for k, v in col_map.items() if k in df.columns}
     df = df[list(present.keys())].rename(columns=present)

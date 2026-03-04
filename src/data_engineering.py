@@ -524,9 +524,15 @@ def build_features(config: dict) -> pd.DataFrame:
     # Macro columns for exogenous lags (FRED + yield indices from market data)
     macro_cols = [
         c for c in [
+            # Original FRED series
             "usd_index", "cpi", "fed_funds", "t10y2y",
+            # Treasury yields from Yahoo Finance
             "t3m_yield_close", "t5y_yield_close",
             "t10y_yield_close", "t30y_yield_close",
+            # New: oil-specific risk & forward inflation (FRED, daily)
+            "ovx", "t5yie", "t10yie", "hy_spread",
+            # New: real-economy demand drivers (FRED, monthly → forward-filled)
+            "indpro", "oil_prod_ip", "cap_util", "unemployment",
         ]
         if c in df.columns
     ]

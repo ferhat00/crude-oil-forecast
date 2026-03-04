@@ -17,10 +17,19 @@ logger = logging.getLogger(__name__)
 # Feature name patterns → pyGAM term type
 # Linear (l): features with an expected near-linear relationship with crude price
 MACRO_PATTERNS = (
+    # FRED macro / rates
     "usd_index", "cpi", "fed_funds", "t10y2y",
+    # Treasury yields (Yahoo Finance)
     "t3m_yield", "t5y_yield", "t10y_yield", "t30y_yield",
+    # FX pairs
     "eur_usd", "gbp_usd", "usd_cad", "usd_nok",
     "usd_rub", "usd_cny", "aud_usd", "nzd_usd", "usd_chf",
+    # New FRED: breakeven inflation & credit spreads
+    "t5yie", "t10yie", "hy_spread",
+    # New FRED: real-economy demand drivers (monthly, forward-filled)
+    "indpro", "oil_prod_ip", "cap_util", "unemployment",
+    # Note: ovx (crude oil vol index) intentionally excluded — treated as
+    # non-linear spline, same as vix_close.
 )
 # Cyclic spline (s, basis='cp'): calendar features that wrap around
 CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
@@ -148,7 +157,8 @@ def define_gam_terms(
     """Build pyGAM terms formula based on feature names.
 
     Term assignment strategy:
-    - Macro indicators (usd_index, cpi, fed_funds, t10y2y): linear term l()
+    - Macro indicators (usd_index, cpi, fed_funds, t10y2y, t5yie, t10yie,
+      hy_spread, indpro, cap_util, unemployment): linear term l()
     - Rolling statistics (sma, std): spline s(n_splines=25)
     - Lag features: spline s(n_splines=20)
     - Calendar features (day_of_week, month, day_of_year): cyclic spline s(basis='cp')

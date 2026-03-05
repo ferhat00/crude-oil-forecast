@@ -26,6 +26,15 @@ data:
     oil_prod_ip:  "IPG211111CN"    # Industrial Production: Crude Oil Extraction (monthly)
     cap_util:     "TCU"            # Capacity Utilization: Total Index (monthly)
     unemployment: "UNRATE"         # Unemployment Rate (monthly)
+    # ── Financial conditions & stress indices (weekly) ───────────────────────
+    nfci:           "NFCI"           # Chicago Fed National Financial Conditions Index
+    kcfsi:          "KCFSI"          # Kansas City Fed Financial Stress Index
+    # ── Global demand & activity (monthly) ───────────────────────────────────
+    china_pmi:      "CHNMANTPMMEI"   # China Manufacturing PMI (OECD via FRED)
+    ism_pmi:        "NAPM"           # US ISM Manufacturing PMI
+    cfnai:          "CFNAI"          # Chicago Fed National Activity Index
+    m2:             "M2SL"           # M2 Money Supply
+    recession_prob: "STLPPM"         # St. Louis Fed Recession Probability
   eia_series:
     crude_stocks:      "PET.WTTSTUS1.W"   # Weekly U.S. Ending Stocks of Crude Oil
     production:        "PET.WCRFPUS2.W"   # Weekly U.S. Crude Oil Production
@@ -51,6 +60,14 @@ alpha_vantage:
 
 cot:
   enabled: true  # CFTC Commitments of Traders — WTI speculative positioning (no API key)
+
+baker_hughes:
+  enabled: true   # Baker Hughes weekly North America rotary rig count (no API key)
+  # Public Excel file; update this URL if Baker Hughes rotates it
+  url: "https://rigcount.bakerhughes.com/static-files/7241bfc7-5ef9-4994-b5a0-e4e2e02c9ef3"
+  us_oil_col: "Oil"    # Column name for US oil rigs in the Excel sheet
+  us_gas_col: "Gas"    # Column name for US gas rigs
+  us_misc_col: "Misc." # Column name for miscellaneous rigs (added to total)
 
 market_tickers:
   # ── Currencies (USD vs oil-relevant economies) ──────────────────────────────

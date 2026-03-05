@@ -1,5 +1,6 @@
 """Data acquisition from Yahoo Finance, FRED, and EIA APIs."""
 
+import io
 import logging
 import time
 from pathlib import Path
@@ -293,7 +294,9 @@ def fetch_cot_data(
     Returns:
         DataFrame indexed by weekly report date with positioning columns:
         cot_open_interest, cot_commercial_long/short/net,
-        cot_mm_long/short/net, cot_mm_long_pct.
+        cot_mm_long/short/net/long_pct, cot_swap_long/short/net,
+        cot_other_long/short/net, cot_small_long/short/net,
+        cot_conc4_long/short.
     """
     logger.info("Fetching CFTC COT data for WTI crude oil")
 
@@ -338,10 +341,24 @@ def fetch_cot_data(
     col_map = {
         "report_date_as_yyyy_mm_dd": "date",
         "open_interest_all": "cot_open_interest",
+        # Commercial (producers / merchants / processors / users)
         "prod_merc_positions_long": "cot_commercial_long",
         "prod_merc_positions_short": "cot_commercial_short",
+        # Managed money (hedge funds / CTAs)
         "m_money_positions_long_all": "cot_mm_long",
         "m_money_positions_short_all": "cot_mm_short",
+        # Swap dealers (banks / financial intermediaries)
+        "swap_positions_long_all": "cot_swap_long",
+        "swap_positions_short_all": "cot_swap_short",
+        # Other reportables (other large speculators)
+        "other_rept_positions_long": "cot_other_long",
+        "other_rept_positions_short": "cot_other_short",
+        # Non-reportable / small speculators (often contrarian signal)
+        "nonrept_positions_long_all": "cot_small_long",
+        "nonrept_positions_short_all": "cot_small_short",
+        # Top-4 trader concentration (gross)
+        "conc_gross_le_4_tdr_long_all": "cot_conc4_long",
+        "conc_gross_le_4_tdr_short_all": "cot_conc4_short",
     }
     present = {k: v for k, v in col_map.items() if k in df.columns}
     df = df[list(present.keys())].rename(columns=present)
@@ -358,6 +375,12 @@ def fetch_cot_data(
         df["cot_mm_long_pct"] = df["cot_mm_long"] / df["cot_open_interest"]
     if {"cot_commercial_long", "cot_commercial_short"}.issubset(df.columns):
         df["cot_commercial_net"] = df["cot_commercial_long"] - df["cot_commercial_short"]
+    if {"cot_swap_long", "cot_swap_short"}.issubset(df.columns):
+        df["cot_swap_net"] = df["cot_swap_long"] - df["cot_swap_short"]
+    if {"cot_other_long", "cot_other_short"}.issubset(df.columns):
+        df["cot_other_net"] = df["cot_other_long"] - df["cot_other_short"]
+    if {"cot_small_long", "cot_small_short"}.issubset(df.columns):
+        df["cot_small_net"] = df["cot_small_long"] - df["cot_small_short"]
 
     logger.info(f"  COT data: {len(df)} weekly observations")
 
@@ -366,6 +389,118 @@ def fetch_cot_data(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(save_path)
         logger.info(f"Saved COT data to {save_path}")
+
+    return df
+
+
+def fetch_baker_hughes_rig_count(
+    config: dict,
+    save_path: Path | None = None,
+) -> pd.DataFrame:
+    """Fetch Baker Hughes North America Rotary Rig Count (weekly, no API key).
+
+    Downloads the public Excel file published weekly by Baker Hughes and
+    extracts US oil, gas, and total rig counts.  The file URL is read from
+    ``config["baker_hughes"]["url"]`` so it can be updated without code
+    changes if Baker Hughes rotates the static file link.
+
+    Args:
+        config: Project configuration dict.
+        save_path: Optional path to save result as parquet.
+
+    Returns:
+        DataFrame indexed by weekly date with columns:
+        us_oil_rigs, us_gas_rigs, us_total_rigs.
+    """
+    bh_cfg = config.get("baker_hughes", {})
+    url = bh_cfg.get(
+        "url",
+        "https://rigcount.bakerhughes.com/static-files/7241bfc7-5ef9-4994-b5a0-e4e2e02c9ef3",
+    )
+    logger.info(f"Fetching Baker Hughes rig count from {url}")
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
+            if attempt < 3:
+                wait = 10 * attempt
+                logger.warning(
+                    f"  BH rig count request failed (attempt {attempt}/3): {exc}, "
+                    f"retrying in {wait}s..."
+                )
+                time.sleep(wait)
+            else:
+                raise
+
+    excel_bytes = io.BytesIO(response.content)
+
+    # Baker Hughes North America rotary rig count — primary sheet name
+    _primary_sheet = "North America Rotary Rig Count (Raw Data)"
+    try:
+        raw = pd.read_excel(
+            excel_bytes,
+            sheet_name=_primary_sheet,
+            skiprows=6,
+            engine="openpyxl",
+        )
+    except Exception as exc:
+        logger.warning(
+            f"  Could not read sheet '{_primary_sheet}' ({exc}); "
+            "falling back to sheet index 1"
+        )
+        excel_bytes.seek(0)
+        raw = pd.read_excel(excel_bytes, sheet_name=1, skiprows=6, engine="openpyxl")
+
+    # Identify the date column (first column named "Date" or "Week Ending")
+    date_col = next(
+        (c for c in raw.columns if str(c).strip().lower() in ("date", "week ending")),
+        raw.columns[0],
+    )
+    raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
+    raw = raw.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    raw.index.name = "date"
+
+    oil_col = bh_cfg.get("us_oil_col", "Oil")
+    gas_col = bh_cfg.get("us_gas_col", "Gas")
+    misc_col = bh_cfg.get("us_misc_col", "Misc.")
+
+    df = pd.DataFrame(index=raw.index)
+    if oil_col in raw.columns:
+        df["us_oil_rigs"] = pd.to_numeric(raw[oil_col], errors="coerce")
+    if gas_col in raw.columns:
+        df["us_gas_rigs"] = pd.to_numeric(raw[gas_col], errors="coerce")
+
+    total_candidates = [c for c in raw.columns if str(c).strip().lower() == "total"]
+    if total_candidates:
+        df["us_total_rigs"] = pd.to_numeric(raw[total_candidates[0]], errors="coerce")
+    elif {"us_oil_rigs", "us_gas_rigs"}.issubset(df.columns):
+        misc = (
+            pd.to_numeric(raw[misc_col], errors="coerce").fillna(0)
+            if misc_col in raw.columns
+            else 0
+        )
+        df["us_total_rigs"] = df["us_oil_rigs"] + df["us_gas_rigs"] + misc
+
+    df = df.dropna(how="all")
+
+    # Validate — warn if the layout may have changed
+    if "us_oil_rigs" not in df.columns or df["us_oil_rigs"].notna().sum() < 50:
+        logger.warning(
+            "  BH rig count: 'us_oil_rigs' is missing or has fewer than 50 valid rows. "
+            "The Excel layout may have changed — check the 'baker_hughes.url' and "
+            f"'baker_hughes.us_oil_col' config keys. Available columns: {list(raw.columns)}"
+        )
+    else:
+        logger.info(f"  BH rig count: {len(df)} weekly observations")
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(save_path)
+        logger.info(f"Saved BH rig count to {save_path}")
 
     return df
 
@@ -448,7 +583,7 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
 
     Returns:
         Dict with keys 'oil', 'fred', 'market', one key per EIA series,
-        and optionally 'cot' and 'alpha_vantage'.
+        and optionally 'cot', 'baker_hughes', and 'alpha_vantage'.
     """
     root = get_project_root(config)
     raw_dir = root / "data" / "raw"
@@ -486,6 +621,27 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
                 result["cot"] = pd.read_parquet(cot_path)
             else:
                 raise
+
+    # Baker Hughes weekly rig count (no API key required)
+    bh_cfg = config.get("baker_hughes", {})
+    if bh_cfg.get("enabled", False):
+        bh_path = raw_dir / "baker_hughes.parquet"
+        try:
+            result["baker_hughes"] = fetch_baker_hughes_rig_count(
+                config=config,
+                save_path=bh_path,
+            )
+        except Exception as exc:
+            if bh_path.exists():
+                logger.warning(
+                    f"Baker Hughes fetch failed ({exc}); loading cached data from {bh_path}"
+                )
+                result["baker_hughes"] = pd.read_parquet(bh_path)
+            else:
+                logger.warning(
+                    f"Baker Hughes fetch failed and no cache available: {exc}. "
+                    "Continuing without rig count data."
+                )
 
     # Alpha Vantage economic indicators
     av_cfg = config.get("alpha_vantage", {})

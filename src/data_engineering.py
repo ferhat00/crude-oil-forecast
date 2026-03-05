@@ -22,12 +22,14 @@ def merge_datasets(
     market_df: pd.DataFrame | None = None,
     cot_df: pd.DataFrame | None = None,
     alpha_vantage_df: pd.DataFrame | None = None,
+    baker_hughes_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Merge all data sources on date index.
 
-    EIA, COT, and Alpha Vantage data (weekly/monthly) are resampled to daily
-    via forward-fill before merging. All DataFrames are left-joined on the oil
-    price base index, then forward-filled to handle weekends/holidays.
+    EIA, COT, Alpha Vantage, and Baker Hughes data (weekly/monthly) are
+    resampled to daily via forward-fill before merging. All DataFrames are
+    left-joined on the oil price base index, then forward-filled to handle
+    weekends/holidays.
 
     Args:
         oil_df: Daily oil OHLCV data (WTI + Brent).
@@ -36,6 +38,7 @@ def merge_datasets(
         market_df: Optional DataFrame of broad market close prices.
         cot_df: Optional weekly CFTC COT positioning DataFrame.
         alpha_vantage_df: Optional monthly Alpha Vantage economic indicators.
+        baker_hughes_df: Optional weekly Baker Hughes rig count DataFrame.
 
     Returns:
         Merged DataFrame with daily frequency and no gaps in the oil series.
@@ -65,6 +68,11 @@ def merge_datasets(
     if alpha_vantage_df is not None and not alpha_vantage_df.empty:
         av_daily = alpha_vantage_df.resample("D").ffill()
         merged = merged.join(av_daily, how="left")
+
+    # Baker Hughes rig count (weekly → resample to daily via ffill)
+    if baker_hughes_df is not None and not baker_hughes_df.empty:
+        bh_daily = baker_hughes_df.resample("D").ffill()
+        merged = merged.join(bh_daily, how="left")
 
     # Forward-fill remaining NaN from weekends / different trading calendars
     merged = merged.ffill()
@@ -421,6 +429,69 @@ def add_price_level_features(
     return df
 
 
+def add_cot_index_features(
+    df: pd.DataFrame,
+    net_cols: list[str],
+    window: int = 364,
+) -> pd.DataFrame:
+    """Compute the COT Index (rolling percentile rank) for net positioning columns.
+
+    The COT Index normalises raw net positions to a 0–1 scale relative to
+    their own rolling history, making levels comparable across different market
+    regimes.  A reading near 1 means the trader category is more net-long than
+    at any point in the prior 52 weeks; near 0 means historically max short.
+
+    Uses scipy.stats.percentileofscore with raw=True for performance.
+
+    Args:
+        df: Input DataFrame (daily frequency after forward-fill).
+        net_cols: Net position columns to index
+            (e.g., ["cot_mm_net", "cot_commercial_net"]).
+        window: Rolling window in calendar days (364 ≈ 52 weekly COT reports).
+
+    Returns:
+        DataFrame with ``{col}_index`` columns added (range 0.0–1.0).
+    """
+    from scipy.stats import percentileofscore
+
+    for col in net_cols:
+        if col not in df.columns:
+            logger.warning(f"  COT index: column '{col}' not found, skipping.")
+            continue
+        df[f"{col}_index"] = (
+            df[col]
+            .rolling(window=window, min_periods=window // 2)
+            .apply(
+                lambda x: percentileofscore(x[:-1], x[-1], kind="rank") / 100.0,
+                raw=True,
+            )
+        )
+    return df
+
+
+def add_rig_count_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute derived features from the Baker Hughes US oil rig count.
+
+    Week-over-week and 4-week changes capture the pace of drilling activity,
+    which leads crude supply changes by roughly 3–6 months.
+
+    Args:
+        df: Input DataFrame containing 'us_oil_rigs' column.
+
+    Returns:
+        DataFrame with rig count change and moving average columns added.
+    """
+    col = "us_oil_rigs"
+    if col not in df.columns:
+        logger.warning("  Rig count features skipped: 'us_oil_rigs' not found.")
+        return df
+
+    df["us_oil_rigs_chg_1w"] = df[col].diff(7)
+    df["us_oil_rigs_chg_4w"] = df[col].diff(28)
+    df["us_oil_rigs_ma4w"] = df[col].rolling(window=28, min_periods=14).mean()
+    return df
+
+
 # ─────────────────────────────────────────────
 # Pipeline Orchestrator
 # ─────────────────────────────────────────────
@@ -484,6 +555,12 @@ def build_features(config: dict) -> pd.DataFrame:
         alpha_vantage_df = pd.read_parquet(av_path)
         logger.info(f"Loaded Alpha Vantage data: {list(alpha_vantage_df.columns)}")
 
+    baker_hughes_df = None
+    bh_path = raw_dir / "baker_hughes.parquet"
+    if bh_path.exists():
+        baker_hughes_df = pd.read_parquet(bh_path)
+        logger.info(f"Loaded Baker Hughes rig count: {len(baker_hughes_df)} rows")
+
     logger.info(f"Oil price columns: {list(oil_df.columns)}")
 
     # ── Merge ─────────────────────────────────────────
@@ -491,6 +568,7 @@ def build_features(config: dict) -> pd.DataFrame:
         oil_df, fred_df, eia_dfs, market_df,
         cot_df=cot_df,
         alpha_vantage_df=alpha_vantage_df,
+        baker_hughes_df=baker_hughes_df,
     )
     logger.info(f"Merged columns: {list(df.columns)}")
 
@@ -529,10 +607,14 @@ def build_features(config: dict) -> pd.DataFrame:
             # Treasury yields from Yahoo Finance
             "t3m_yield_close", "t5y_yield_close",
             "t10y_yield_close", "t30y_yield_close",
-            # New: oil-specific risk & forward inflation (FRED, daily)
+            # Oil-specific risk & forward inflation (FRED, daily)
             "ovx", "t5yie", "t10yie", "hy_spread",
-            # New: real-economy demand drivers (FRED, monthly → forward-filled)
+            # Real-economy demand drivers (FRED, monthly → forward-filled)
             "indpro", "oil_prod_ip", "cap_util", "unemployment",
+            # Financial conditions & stress indices (FRED, weekly)
+            "nfci", "kcfsi",
+            # Global demand & activity (FRED, monthly → forward-filled)
+            "china_pmi", "ism_pmi", "cfnai", "m2", "recession_prob",
         ]
         if c in df.columns
     ]
@@ -556,6 +638,20 @@ def build_features(config: dict) -> pd.DataFrame:
     if cot_cols:
         df = add_exogenous_lags(df, cot_cols, lags=[7, 14])
 
+    # 3a-ii. COT Index (percentile rank over rolling 52-week window)
+    cot_net_cols = [
+        c for c in [
+            "cot_mm_net", "cot_commercial_net",
+            "cot_swap_net", "cot_other_net", "cot_small_net",
+        ]
+        if c in df.columns
+    ]
+    if cot_net_cols:
+        df = add_cot_index_features(df, cot_net_cols, window=364)
+        cot_index_cols = [f"{c}_index" for c in cot_net_cols if f"{c}_index" in df.columns]
+        if cot_index_cols:
+            df = add_exogenous_lags(df, cot_index_cols, lags=[7, 14])
+
     # 3b. Alpha Vantage economic indicator lags
     av_cols = [c for c in df.columns if c.startswith("av_")]
     if av_cols:
@@ -571,6 +667,9 @@ def build_features(config: dict) -> pd.DataFrame:
         ])
     ]
     df = add_exogenous_lags(df, market_lag_cols, lags=[1, 7])
+
+    # 3d. Rig count derived features (supply leading indicator)
+    df = add_rig_count_features(df)
 
     # 4. Rolling SMAs, EMAs, and volatility: 14, 50, 200 days
     df = add_rolling_features(df, target_col, [14, 50, 200])

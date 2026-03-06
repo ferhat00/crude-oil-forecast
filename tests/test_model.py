@@ -7,9 +7,16 @@ import pytest
 from src.model import (
     _classify_feature,
     build_feature_matrix,
+    compute_bic,
+    compute_rolling_nu_tau,
     cross_validate,
     define_gam_terms,
+    fit_distributional_gam,
     fit_gam,
+    fit_sigma_gam,
+    select_sigma_features,
+    select_nu_tau_features,
+    stepwise_aic_selection,
 )
 
 
@@ -123,7 +130,7 @@ class TestCrossValidate:
     def test_cv_returns_correct_structure(self, sample_feature_df, sample_config):
         X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
-        results = cross_validate(X, y, terms, n_splits=3, lam_values=[0.1, 1])
+        results = cross_validate(X, y, terms, n_splits=3, embargo_days=5, lam_values=[0.1, 1])
 
         assert "fold_metrics" in results
         assert "mean_mae" in results
@@ -132,3 +139,103 @@ class TestCrossValidate:
         assert len(results["fold_metrics"]) == 3
         assert results["mean_mae"] > 0
         assert results["mean_rmse"] > 0
+
+
+class TestComputeBic:
+    def test_bic_greater_than_aic_for_large_n(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        terms = define_gam_terms(names, sample_config)
+        gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
+        bic = compute_bic(gam, len(y))
+        aic = gam.statistics_["AIC"]
+        # BIC = AIC + edof * (log(n) - 2); for n > ~7.4, log(n) > 2 so BIC > AIC
+        assert bic >= aic
+
+    def test_bic_returns_float(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        terms = define_gam_terms(names, sample_config)
+        gam = fit_gam(X, y, terms, lam_values=[1])
+        assert isinstance(compute_bic(gam, len(y)), float)
+
+
+class TestStepwiseBIC:
+    def test_bic_stepwise_reduces_features(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        n_orig = len(names)
+        X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
+            X, y, names, sample_config,
+            lam_values=[0.1, 1],
+            criterion="bic",
+            target_max_terms=4,
+        )
+        assert len(sel_names) <= 4
+        assert len(sel_names) + len(dropped) == n_orig
+        assert X_sel.shape[1] == len(sel_names)
+
+    def test_aic_stepwise_still_works(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
+            X, y, names, sample_config,
+            lam_values=[0.1, 1],
+            criterion="aic",
+        )
+        assert len(sel_names) >= 1
+        assert X_sel.shape[1] == len(sel_names)
+
+
+class TestSigmaModel:
+    def test_select_sigma_features(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X_sig, sig_names, indices = select_sigma_features(names, X)
+        # At least _std_ should match CL=F_close_std_14
+        assert len(sig_names) >= 1
+        assert X_sig.shape[1] == len(sig_names)
+        assert all(n in names for n in sig_names)
+
+    def test_fit_sigma_gam(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        terms = define_gam_terms(names, sample_config)
+        gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
+        residuals = y - gam.predict(X)
+
+        X_sig, sig_names, _ = select_sigma_features(names, X)
+        sigma_gam, sel_names, sel_idx = fit_sigma_gam(
+            X_sig, residuals, sig_names, sample_config, lam_values=[0.1, 1]
+        )
+        # sigma_gam must predict same n rows as X_sig[:, sel_idx]
+        preds = sigma_gam.predict(X_sig[:, sel_idx])
+        assert len(preds) == len(y)
+        sigma_pred = np.exp(preds)
+        assert np.all(sigma_pred > 0)
+
+
+class TestNuTauModels:
+    def test_compute_rolling_nu_tau(self):
+        rng = np.random.default_rng(0)
+        std_res = rng.standard_normal(200)
+        valid_mask, nu_vals, tau_vals = compute_rolling_nu_tau(std_res, window=30)
+        assert valid_mask.sum() == len(nu_vals)
+        assert valid_mask.sum() == len(tau_vals)
+        assert valid_mask.sum() == 200 - 30 + 1
+        assert np.all(tau_vals > 0)
+
+    def test_select_nu_tau_features_fallback(self, sample_feature_df, sample_config):
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        # sample_feature_df has no ovx/vix/hy_spread — should fallback gracefully
+        X_nt, nt_names, indices = select_nu_tau_features(names, X)
+        assert X_nt.shape[0] == X.shape[0]
+        assert len(nt_names) >= 1
+
+    def test_fit_distributional_gam(self, sample_feature_df, sample_config):
+        rng = np.random.default_rng(1)
+        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X_nt, nt_names, _ = select_nu_tau_features(names, X)
+        std_res = rng.standard_normal(len(y))
+        valid_mask, rolling_nu, _ = compute_rolling_nu_tau(std_res, window=30)
+        X_valid = X_nt[valid_mask]
+        nu_gam, sel_names, sel_idx = fit_distributional_gam(
+            X_valid, rolling_nu, nt_names, sample_config,
+            lam_values=[0.1, 1], max_terms=3, param_name="nu",
+        )
+        preds = nu_gam.predict(X_valid[:, sel_idx])
+        assert len(preds) == X_valid.shape[0]

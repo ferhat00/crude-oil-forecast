@@ -87,6 +87,14 @@ model:
   lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
   cv_splits: 5
   embargo_days: 200         # Obs to drop between train/test boundary (= max rolling window)
-  stepwise_selection: true  # Backward AIC elimination to drop irrelevant/redundant features
+  stepwise_selection: true  # Backward elimination to drop irrelevant/redundant features
+  stepwise_criterion: "bic" # "bic" (default, more aggressive) or "aic"
   stepwise_max_steps: 50    # Max elimination iterations (null = unlimited)
+  target_max_terms: 25      # Hard cap on mu model terms after BIC stepwise (null = no cap)
   n_jobs: -1                # Parallel workers: -1 = all logical CPUs, 1 = sequential
+  # ── Distributional sub-models (sigma, nu, tau) ─────────────────────────────
+  sigma_stepwise: true      # Apply BIC stepwise to sigma sub-model
+  sigma_max_terms: 12       # Hard cap on sigma model terms
+  nu_tau_window: 60         # Rolling window (days) for skewness/kurtosis estimation
+  nu_max_terms: 8           # Hard cap on nu (skewness) model terms
+  tau_max_terms: 8          # Hard cap on tau (tail-weight) model terms

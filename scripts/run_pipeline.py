@@ -80,7 +80,7 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("STEP 4: Model Training & Cross-Validation")
     logger.info("=" * 60)
-    gam, cv_results = train_and_save(config)
+    mu_gam, sigma_gam, nu_gam, tau_gam, cv_results = train_and_save(config)
 
     # Step 5: Evaluation
     logger.info("=" * 60)
@@ -90,8 +90,8 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("Pipeline complete!")
-    logger.info("  - Figures: outputs/figures/")
-    logger.info("  - Model:   outputs/models/gam_model.pkl")
+    logger.info("  - Figures:       outputs/figures/")
+    logger.info("  - Models:        outputs/models/gam_models.pkl  (mu, sigma, nu, tau)")
     logger.info("  - Run dashboard: streamlit run app/dashboard.py")
     logger.info("=" * 60)
 

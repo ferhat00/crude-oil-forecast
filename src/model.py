@@ -34,6 +34,34 @@ RETURN_PATTERNS = ("_pct_change", "_log_return")
 # Spline: spread, ratio, and price-level features
 SPREAD_PATTERNS = ("_spread", "_ratio", "_dist_sma", "_pct_range", "_52w")
 
+# Volatility / risk patterns → candidate features for the sigma (scale) sub-model
+SIGMA_FEATURE_PATTERNS = (
+    "ovx", "vix", "_std_", "_bb_width", "hy_spread", "_log_return", "t5yie", "t10yie",
+)
+
+# Risk / regime patterns → candidate features for the nu (skewness) and tau (tail) sub-models
+NU_TAU_FEATURE_PATTERNS = ("ovx", "vix", "hy_spread", "t5yie", "t10yie")
+
+
+def compute_bic(gam: LinearGAM, n_samples: int) -> float:
+    """Bayesian Information Criterion for a fitted LinearGAM.
+
+    BIC penalises model complexity more aggressively than AIC for large
+    datasets (penalty grows with log(n) instead of a constant 2)::
+
+        BIC = AIC + edof × (log(n) − 2)
+
+    Args:
+        gam: Fitted LinearGAM with populated .statistics_.
+        n_samples: Number of training observations.
+
+    Returns:
+        BIC as a float.
+    """
+    aic = gam.statistics_["AIC"]
+    edof = float(gam.statistics_.get("edof", 0.0))
+    return float(aic + edof * (np.log(n_samples) - 2.0))
+
 
 def build_feature_matrix(
     df: pd.DataFrame,
@@ -420,17 +448,24 @@ def stepwise_aic_selection(
     lam_values: list[float] | None = None,
     max_steps: int | None = None,
     n_jobs: int = 1,
+    criterion: str = "bic",
+    target_max_terms: int | None = None,
 ) -> tuple[np.ndarray, list[int], list[str], list[str], LinearGAM]:
-    """Iterative backward AIC elimination for GAM feature selection.
+    """Iterative backward BIC/AIC elimination for GAM feature selection.
 
     At each step the least-significant term (highest p-value) is the candidate
     for removal.  A trial model is fitted *without* that term using a fixed λ
     (inherited from the previous step) for speed.  The drop is accepted when
-    trial AIC ≤ current AIC.  Once no single removal improves AIC the loop
-    stops and the final model is refit with a full grid-search.
+    trial score ≤ current score (where score is BIC by default, or AIC).
+    Once no single removal improves the score the loop stops.
 
-    This removes redundant, correlated, or uninformative features, reducing
-    model complexity and the risk of over-fitting.
+    A secondary **hard-cap** loop then unconditionally drops the highest
+    p-value terms one at a time until ``target_max_terms`` is reached, even
+    if removing them would worsen the information criterion.  This keeps the
+    final model small enough to avoid overfitting when the dataset is large.
+
+    Both loops use fast fixed-λ trial fits; the final model is refit with a
+    full grid-search for a clean λ estimate.
 
     Args:
         X: Full feature matrix (n_samples × n_features).
@@ -438,8 +473,13 @@ def stepwise_aic_selection(
         feature_names: Column names aligned with X.
         config: Project configuration.
         lam_values: Lambda values for the initial and final grid-search.
-            Trial fits inside the loop use fixed λ (fast).
         max_steps: Maximum elimination iterations (default: len(feature_names)).
+        criterion: Information criterion for the elimination loop.
+            ``"bic"`` (default) penalises complexity more aggressively;
+            ``"aic"`` is less conservative.
+        target_max_terms: Hard upper bound on the number of retained terms.
+            After the criterion-based loop, terms are dropped by descending
+            p-value until this limit is reached (ignored if None).
 
     Returns:
         Tuple of (X_selected, selected_indices, selected_names, dropped_names, gam).
@@ -455,12 +495,13 @@ def stepwise_aic_selection(
     # ── Initial full model (grid-search) ─────────────────────────────────────
     terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
     gam = fit_gam(X[:, current_indices], y, terms, lam_values, n_jobs=n_jobs)
-    current_aic = gam.statistics_["AIC"]
+    n_samples = len(y)
+    current_score = compute_bic(gam, n_samples) if criterion == "bic" else gam.statistics_["AIC"]
     current_lam = gam.lam  # reuse for fast trial fits
 
     logger.info(
-        f"Stepwise AIC selection — start: {len(current_indices)} features, "
-        f"AIC={current_aic:.4f}"
+        f"Stepwise {criterion.upper()} selection — start: {len(current_indices)} features, "
+        f"{criterion.upper()}={current_score:.4f}"
     )
 
     for step in range(max_steps):
@@ -488,25 +529,56 @@ def stepwise_aic_selection(
         trial_gam_fast = LinearGAM(trial_terms)
         trial_gam_fast.lam = trial_lam
         trial_gam_fast.fit(X[:, trial_indices], y)
-        trial_aic = trial_gam_fast.statistics_["AIC"]
+        trial_score = (
+            compute_bic(trial_gam_fast, n_samples) if criterion == "bic"
+            else trial_gam_fast.statistics_["AIC"]
+        )
 
-        if trial_aic <= current_aic:
+        if trial_score <= current_score:
             logger.info(
                 f"  Step {step + 1}: drop '{candidate_name}' "
-                f"(p={worst_pval:.4f}, AIC {current_aic:.4f} → {trial_aic:.4f} ✓)"
+                f"(p={worst_pval:.4f}, {criterion.upper()} {current_score:.4f} → {trial_score:.4f} ✓)"
             )
             dropped_names.append(candidate_name)
             current_indices = trial_indices
             gam = trial_gam_fast
-            current_aic = trial_aic
+            current_score = trial_score
             current_lam = gam.lam
         else:
             logger.info(
                 f"  Step {step + 1}: keeping '{candidate_name}' "
-                f"(p={worst_pval:.4f}, AIC would worsen "
-                f"{current_aic:.4f} → {trial_aic:.4f} ✗). Stopping."
+                f"(p={worst_pval:.4f}, {criterion.upper()} would worsen "
+                f"{current_score:.4f} → {trial_score:.4f} ✗). Stopping."
             )
             break
+
+    # ── Hard cap: unconditional elimination to reach target_max_terms ─────────
+    if target_max_terms is not None and len(current_indices) > target_max_terms:
+        logger.info(
+            f"Applying hard cap: reducing from {len(current_indices)} → "
+            f"{target_max_terms} terms by p-value order…"
+        )
+        while len(current_indices) > target_max_terms and len(current_indices) > 1:
+            p_values = list(gam.statistics_.get("p_values", []))
+            if not p_values:
+                break
+            term_pvals = np.array(p_values[: len(current_indices)])
+            worst_local = int(np.argmax(term_pvals))
+            candidate_name = feature_names[current_indices[worst_local]]
+            trial_indices = [idx for i, idx in enumerate(current_indices) if i != worst_local]
+            trial_terms = _build_gam_terms_for_indices(trial_indices, feature_names, config)
+            trial_lam = [lv for i, lv in enumerate(current_lam) if i != worst_local]
+            trial_gam = LinearGAM(trial_terms)
+            trial_gam.lam = trial_lam
+            trial_gam.fit(X[:, trial_indices], y)
+            logger.info(
+                f"  Hard-cap drop: '{candidate_name}' "
+                f"({len(current_indices)} → {len(trial_indices)} terms)"
+            )
+            dropped_names.append(candidate_name)
+            current_indices = trial_indices
+            gam = trial_gam
+            current_lam = gam.lam
 
     selected_names = [feature_names[i] for i in current_indices]
     logger.info(
@@ -519,9 +591,229 @@ def stepwise_aic_selection(
         logger.info("Refitting final model on selected features (full grid-search)…")
         final_terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
         gam = fit_gam(X[:, current_indices], y, final_terms, lam_values, n_jobs=n_jobs)
-        logger.info(f"Final AIC after grid-search: {gam.statistics_['AIC']:.4f}")
+        logger.info(f"Final {criterion.upper()} after grid-search: {gam.statistics_['AIC']:.4f}")
 
     return X[:, current_indices], current_indices, selected_names, dropped_names, gam
+
+
+def compute_rolling_nu_tau(
+    std_residuals: np.ndarray,
+    window: int = 60,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute rolling skewness (nu) and tail-weight proxy (tau) from standardised residuals.
+
+    Rolling skewness estimates the time-varying asymmetry of forecast errors.
+    Rolling excess kurtosis is mapped to a tau proxy::
+
+        tau = 1 / (1 + max(0, excess_kurtosis))
+
+    This ensures large kurtosis (heavy tails) maps to small tau, consistent
+    with Johnson SU where smaller tau → heavier tails.
+
+    Args:
+        std_residuals: Standardised residuals ``(y - mu) / sigma``.
+        window: Rolling window in observations (default: 60 trading days).
+
+    Returns:
+        Tuple of (valid_mask, rolling_nu, rolling_tau) where *valid_mask* is
+        a boolean array of length ``len(std_residuals)`` marking non-NaN rows,
+        and *rolling_nu* / *rolling_tau* are the corresponding valid values.
+    """
+    s = pd.Series(std_residuals)
+    rolling_nu = s.rolling(window).skew().values
+    rolling_kurt = s.rolling(window).kurt().values       # excess kurtosis
+    rolling_tau = 1.0 / (1.0 + np.clip(rolling_kurt, 0.0, None))
+    valid_mask = ~np.isnan(rolling_nu) & ~np.isnan(rolling_tau)
+    return valid_mask, rolling_nu[valid_mask], rolling_tau[valid_mask]
+
+
+def select_sigma_features(
+    feature_names: list[str],
+    X: np.ndarray,
+) -> tuple[np.ndarray, list[str], list[int]]:
+    """Select volatility-relevant features from the mu feature set for the sigma sub-model.
+
+    Matches feature names against :data:`SIGMA_FEATURE_PATTERNS`.  If no
+    matches are found all features are returned as fallback.
+
+    Args:
+        feature_names: Names of the mu model's selected features.
+        X: Feature matrix aligned with *feature_names*.
+
+    Returns:
+        Tuple of (X_sigma, sigma_names, col_indices) where *col_indices*
+        are positions into *X* / *feature_names*.
+    """
+    indices = [
+        i for i, n in enumerate(feature_names)
+        if any(p in n.lower() for p in SIGMA_FEATURE_PATTERNS)
+    ]
+    if not indices:
+        logger.warning("No sigma feature patterns matched — using all mu features as fallback.")
+        return X, feature_names, list(range(len(feature_names)))
+    sigma_names = [feature_names[i] for i in indices]
+    logger.info(f"Sigma feature candidates ({len(sigma_names)}): {sigma_names}")
+    return X[:, indices], sigma_names, indices
+
+
+def select_nu_tau_features(
+    feature_names: list[str],
+    X: np.ndarray,
+) -> tuple[np.ndarray, list[str], list[int]]:
+    """Select risk/regime features from the mu feature set for nu/tau sub-models.
+
+    Matches feature names against :data:`NU_TAU_FEATURE_PATTERNS`.  Falls
+    back to sigma feature patterns, then all features if no matches found.
+
+    Args:
+        feature_names: Names of the mu model's selected features.
+        X: Feature matrix aligned with *feature_names*.
+
+    Returns:
+        Tuple of (X_nu_tau, nu_tau_names, col_indices).
+    """
+    indices = [
+        i for i, n in enumerate(feature_names)
+        if any(p in n.lower() for p in NU_TAU_FEATURE_PATTERNS)
+    ]
+    if not indices:
+        # Fallback: use sigma patterns (also volatility-related)
+        indices = [
+            i for i, n in enumerate(feature_names)
+            if any(p in n.lower() for p in SIGMA_FEATURE_PATTERNS)
+        ]
+    if not indices:
+        logger.warning("No nu/tau feature patterns matched — using all mu features as fallback.")
+        return X, feature_names, list(range(len(feature_names)))
+    nu_tau_names = [feature_names[i] for i in indices]
+    logger.info(f"Nu/tau feature candidates ({len(nu_tau_names)}): {nu_tau_names}")
+    return X[:, indices], nu_tau_names, indices
+
+
+def fit_sigma_gam(
+    X_sigma: np.ndarray,
+    mu_residuals: np.ndarray,
+    sigma_feature_names: list[str],
+    config: dict,
+    lam_values: list[float] | None = None,
+    n_jobs: int = 1,
+) -> tuple[LinearGAM, list[str], list[int]]:
+    """Fit a GAM on log|residuals| to model conditional heteroscedasticity (σ).
+
+    The response is ``log(|mu_residuals| + 1e-6)``.  Fitting on the
+    log-absolute-residual is a standard approach for modelling the scale
+    equation in location-scale models:  at prediction time the conditional
+    sigma is recovered as ``exp(sigma_gam.predict(X_sigma))``.
+
+    Stepwise BIC selection is applied (controlled by ``model.sigma_stepwise``
+    and ``model.sigma_max_terms`` in config) to keep the sigma model compact.
+
+    Args:
+        X_sigma: Feature matrix for sigma candidates.
+        mu_residuals: In-sample residuals from the mu model ``(y - mu_pred)``.
+        sigma_feature_names: Column names aligned with *X_sigma*.
+        config: Project configuration.
+        lam_values: Lambda grid for pyGAM fitting.
+        n_jobs: Parallel workers.
+
+    Returns:
+        Tuple of (sigma_gam, selected_names, selected_local_indices) where
+        *selected_local_indices* are positions into *X_sigma*.
+    """
+    model_cfg = config.get("model", {})
+    sigma_max = model_cfg.get("sigma_max_terms")
+    do_stepwise = model_cfg.get("sigma_stepwise", True)
+    log_abs_resid = np.log(np.abs(mu_residuals) + 1e-6)
+
+    if do_stepwise and len(sigma_feature_names) > 1:
+        _, selected_indices, selected_names, dropped, gam = stepwise_aic_selection(
+            X_sigma, log_abs_resid, sigma_feature_names, config,
+            lam_values=lam_values,
+            max_steps=model_cfg.get("stepwise_max_steps"),
+            n_jobs=n_jobs,
+            criterion=model_cfg.get("stepwise_criterion", "bic"),
+            target_max_terms=sigma_max,
+        )
+        logger.info(f"Sigma model: {len(selected_names)} terms retained.")
+        return gam, selected_names, selected_indices
+    else:
+        terms = _build_gam_terms_for_indices(
+            list(range(len(sigma_feature_names))), sigma_feature_names, config
+        )
+        gam = fit_gam(X_sigma, log_abs_resid, terms, lam_values, n_jobs=n_jobs)
+        return gam, sigma_feature_names, list(range(len(sigma_feature_names)))
+
+
+def get_sigma_from_sigma_gam(sigma_gam: LinearGAM, X_sigma: np.ndarray) -> np.ndarray:
+    """Predict conditional scale σ from the sigma sub-model.
+
+    The sigma model regresses ``log|residuals|``, so the predicted scale is::
+
+        σ_pred = exp(sigma_gam.predict(X_sigma))
+
+    Results are clipped to ``[1e-6, ∞)`` to prevent zero or negative scales.
+
+    Args:
+        sigma_gam: Fitted sigma LinearGAM (response was log|residuals|).
+        X_sigma: Feature matrix matching the sigma model's training columns.
+
+    Returns:
+        Array of shape (n_samples,) with per-observation σ.
+    """
+    return np.clip(np.exp(sigma_gam.predict(X_sigma)), 1e-6, None)
+
+
+def fit_distributional_gam(
+    X_nu_tau: np.ndarray,
+    response: np.ndarray,
+    feature_names: list[str],
+    config: dict,
+    lam_values: list[float] | None = None,
+    n_jobs: int = 1,
+    max_terms: int | None = None,
+    param_name: str = "nu",
+) -> tuple[LinearGAM, list[str], list[int]]:
+    """Fit a GAM to model one distributional parameter (nu or tau) as a function of features.
+
+    Rolling skewness (nu) and tail-weight proxy (tau) are regressed on
+    volatility/risk features.  Stepwise BIC reduces each sub-model to at most
+    ``max_terms`` features so the parameters remain interpretable.
+
+    Args:
+        X_nu_tau: Feature matrix of candidate predictors.
+        response: Rolling nu (skewness) or rolling tau (tail weight) array,
+            aligned with the valid rows of X_nu_tau after the rolling window.
+        feature_names: Column names aligned with *X_nu_tau*.
+        config: Project configuration.
+        lam_values: Lambda grid for pyGAM fitting.
+        n_jobs: Parallel workers.
+        max_terms: Hard cap on retained terms (overrides config value).
+        param_name: ``\"nu\"`` or ``\"tau\"`` — used only for logging.
+
+    Returns:
+        Tuple of (gam, selected_names, selected_local_indices) where
+        *selected_local_indices* are positions into *X_nu_tau*.
+    """
+    model_cfg = config.get("model", {})
+    do_stepwise = model_cfg.get("sigma_stepwise", True)  # reuse sigma_stepwise flag
+
+    if do_stepwise and len(feature_names) > 1:
+        _, selected_indices, selected_names, dropped, gam = stepwise_aic_selection(
+            X_nu_tau, response, feature_names, config,
+            lam_values=lam_values,
+            max_steps=model_cfg.get("stepwise_max_steps"),
+            n_jobs=n_jobs,
+            criterion=model_cfg.get("stepwise_criterion", "bic"),
+            target_max_terms=max_terms,
+        )
+        logger.info(f"{param_name} model: {len(selected_names)} terms retained.")
+        return gam, selected_names, selected_indices
+    else:
+        terms = _build_gam_terms_for_indices(
+            list(range(len(feature_names))), feature_names, config
+        )
+        gam = fit_gam(X_nu_tau, response, terms, lam_values, n_jobs=n_jobs)
+        return gam, feature_names, list(range(len(feature_names)))
 
 
 def save_model(gam: LinearGAM, path: str | Path = "outputs/models/gam_model.pkl") -> None:
@@ -554,7 +846,36 @@ def load_feature_names(
     return joblib.load(path)
 
 
-def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
+def save_all_models(
+    models: dict,
+    path: str | Path = "outputs/models/gam_models.pkl",
+) -> None:
+    """Save all distributional sub-models (mu, sigma, nu, tau) as a dict.
+
+    Args:
+        models: Dict with keys ``\"mu\"``, ``\"sigma\"``, ``\"nu\"``, ``\"tau\"``
+            mapped to fitted LinearGAM instances.
+        path: Output path for the serialised dict.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(models, path)
+    logger.info(f"All models saved to {path}")
+
+
+def load_all_models(
+    path: str | Path = "outputs/models/gam_models.pkl",
+) -> dict:
+    """Load all distributional sub-models from the joint pickle.
+
+    Returns:
+        Dict with keys ``\"mu\"``, ``\"sigma\"``, ``\"nu\"``, ``\"tau\"``
+        mapped to fitted LinearGAM instances.
+    """
+    return joblib.load(path)
+
+
+def train_and_save(config: dict) -> tuple:
     """Full training pipeline: load data, (optionally) select features, CV, fit, save.
 
     Pipeline order:
@@ -584,14 +905,16 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
     # Build feature matrix
     X, y, feature_names = build_feature_matrix(df, target)
 
-    # ── Optional stepwise AIC feature selection ───────────────────────────────
+    # ── Optional stepwise BIC feature selection ───────────────────────────────
     if model_cfg.get("stepwise_selection", False):
-        logger.info("Running stepwise AIC feature selection…")
+        logger.info("Running stepwise feature selection…")
         X, _, feature_names, dropped, _ = stepwise_aic_selection(
             X, y, feature_names, config,
             lam_values=lam_values,
             max_steps=model_cfg.get("stepwise_max_steps"),
             n_jobs=n_jobs,
+            criterion=model_cfg.get("stepwise_criterion", "bic"),
+            target_max_terms=model_cfg.get("target_max_terms"),
         )
         logger.info(f"Selected {len(feature_names)} features after stepwise selection.")
         if dropped:
@@ -611,12 +934,63 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
         n_jobs=n_jobs,
     )
 
-    # Fit final model on full dataset
-    logger.info("Fitting final model on full dataset...")
-    gam = fit_gam(X, y, terms, lam_values, n_jobs=n_jobs)
+    # ── Stage 1: Fit final mu (location) model on full dataset ────────────────
+    logger.info("Fitting final mu model on full dataset...")
+    mu_gam = fit_gam(X, y, terms, lam_values, n_jobs=n_jobs)
 
-    # Save model and feature names
-    save_model(gam, model_dir / "gam_model.pkl")
+    # ── Stage 2: Sigma model (conditional heteroscedasticity) ─────────────────
+    logger.info("Fitting sigma (conditional scale) sub-model…")
+    mu_pred = mu_gam.predict(X)
+    mu_residuals = y - mu_pred
+    X_sigma_all, sigma_all_names, _ = select_sigma_features(feature_names, X)
+    sigma_gam, sigma_feature_names, sigma_sel_idx = fit_sigma_gam(
+        X_sigma_all, mu_residuals, sigma_all_names, config,
+        lam_values=lam_values, n_jobs=n_jobs,
+    )
+    X_sigma = X_sigma_all[:, sigma_sel_idx]
+    sigma_pred = get_sigma_from_sigma_gam(sigma_gam, X_sigma)
+
+    # ── Stage 3: Nu and Tau models (rolling moments of standardised residuals) ─
+    nu_tau_window = model_cfg.get("nu_tau_window", 60)
+    std_residuals = mu_residuals / np.clip(sigma_pred, 1e-8, None)
+    valid_mask, rolling_nu, rolling_tau = compute_rolling_nu_tau(
+        std_residuals, window=nu_tau_window
+    )
+
+    X_nu_tau_all, nu_tau_all_names, _ = select_nu_tau_features(feature_names, X)
+    X_nu_tau_valid = X_nu_tau_all[valid_mask]
+
+    logger.info("Fitting nu (skewness) sub-model…")
+    nu_gam, nu_feature_names, nu_sel_idx = fit_distributional_gam(
+        X_nu_tau_valid, rolling_nu, nu_tau_all_names, config,
+        lam_values=lam_values, n_jobs=n_jobs,
+        max_terms=model_cfg.get("nu_max_terms", 8), param_name="nu",
+    )
+
+    logger.info("Fitting tau (tail-weight) sub-model…")
+    tau_gam, tau_feature_names, tau_sel_idx = fit_distributional_gam(
+        X_nu_tau_valid, rolling_tau, nu_tau_all_names, config,
+        lam_values=lam_values, n_jobs=n_jobs,
+        max_terms=model_cfg.get("tau_max_terms", 8), param_name="tau",
+    )
+
+    # ── Save all models and feature name lists ─────────────────────────────────
+    save_model(mu_gam, model_dir / "gam_model.pkl")        # backward compat
     save_feature_names(feature_names, model_dir / "feature_names.pkl")
 
-    return gam, cv_results
+    all_models = {"mu": mu_gam, "sigma": sigma_gam, "nu": nu_gam, "tau": tau_gam}
+    save_all_models(all_models, model_dir / "gam_models.pkl")
+
+    save_feature_names(sigma_feature_names, model_dir / "sigma_feature_names.pkl")
+    save_feature_names(nu_feature_names, model_dir / "nu_feature_names.pkl")
+    save_feature_names(tau_feature_names, model_dir / "tau_feature_names.pkl")
+
+    logger.info(
+        f"All models saved. "
+        f"μ: {len(feature_names)} terms, "
+        f"σ: {len(sigma_feature_names)} terms, "
+        f"ν: {len(nu_feature_names)} terms, "
+        f"τ: {len(tau_feature_names)} terms"
+    )
+
+    return mu_gam, sigma_gam, nu_gam, tau_gam, cv_results

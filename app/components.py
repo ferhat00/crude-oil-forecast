@@ -22,8 +22,25 @@ _CI_FILL_RGBA = [
 _CI_LINE_RGBA = ["rgba(0,0,0,0)"] * 4   # invisible borders between bands
 
 
-def _get_sigma_from_gam(gam: LinearGAM, X: np.ndarray, sigma_scale: float = 1.0) -> np.ndarray:
-    """Back out per-observation predictive σ from the 95% PI."""
+def _get_sigma_from_gam(
+    gam: LinearGAM,
+    X: np.ndarray,
+    sigma_scale: float = 1.0,
+    sigma_gam: LinearGAM | None = None,
+    X_sigma: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-observation predictive σ from sigma_gam (preferred) or PI width (fallback).
+
+    When *sigma_gam* and *X_sigma* are provided the sigma sub-model is used::
+
+        σ = exp(sigma_gam.predict(X_sigma)) × sigma_scale
+
+    Otherwise falls back to backing out σ from the GAM 95% PI::
+
+        σ = (upper_95 − lower_95) / (2 × 1.96) × sigma_scale
+    """
+    if sigma_gam is not None and X_sigma is not None:
+        return np.clip(np.exp(sigma_gam.predict(X_sigma)), 1e-6, None) * sigma_scale
     pi_95 = gam.prediction_intervals(X, width=0.95)
     return np.clip((pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96), 1e-6, None) * sigma_scale
 

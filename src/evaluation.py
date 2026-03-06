@@ -51,42 +51,62 @@ class PredictiveDistribution:
     while replacing the Normal assumption with a distribution that can
     capture skewness and excess kurtosis in the residuals.
     """
-    nu: float        # skewness parameter (a in scipy)
-    tau: float       # tail-weight parameter (b in scipy); smaller = fatter tails
+    nu: float | np.ndarray  # skewness — scalar (global) or per-observation array
+    tau: float | np.ndarray  # tail-weight — scalar or per-observation array (smaller = fatter tails)
     loc_std: float   # location offset in standardised space
     scale_std: float # scale in standardised space
 
-    # ── Per-observation distribution helpers ─────────────────────────────────
+    # ── Per-observation distribution helpers ────────────────────────────────────
 
-    def _params(self, mu: float, sigma: float) -> tuple:
-        """Return the (a, b, loc, scale) scipy args for one prediction."""
+    def _params(self, mu: float, sigma: float, idx: int | None = None) -> tuple:
+        """Return the (a, b, loc, scale) scipy args for one prediction.
+
+        When *nu* or *tau* are per-observation arrays the observation index
+        *idx* selects the correct value.  When *idx* is None and the fields
+        are arrays their mean is used (suitable for single-date display).
+        """
+        if isinstance(self.nu, np.ndarray):
+            nu_i = float(self.nu[idx]) if idx is not None else float(np.mean(self.nu))
+        else:
+            nu_i = float(self.nu)
+        if isinstance(self.tau, np.ndarray):
+            tau_i = float(self.tau[idx]) if idx is not None else float(np.mean(self.tau))
+        else:
+            tau_i = float(self.tau)
         return (
-            self.nu,
-            self.tau,
+            nu_i,
+            tau_i,
             float(mu) + float(sigma) * self.loc_std,
             float(sigma) * self.scale_std,
         )
 
-    def pdf(self, x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    def pdf(self, x: np.ndarray, mu: float, sigma: float, idx: int | None = None) -> np.ndarray:
         """Evaluate the predictive PDF at price grid *x*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return stats.johnsonsu.pdf(x, a, b, loc=loc, scale=scale)
 
-    def ppf(self, q: float, mu: float, sigma: float) -> float:
+    def ppf(self, q: float, mu: float, sigma: float, idx: int | None = None) -> float:
         """Percent-point function (inverse CDF) at quantile *q*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return float(stats.johnsonsu.ppf(q, a, b, loc=loc, scale=scale))
 
-    def cdf(self, x: float, mu: float, sigma: float) -> float:
+    def cdf(self, x: float, mu: float, sigma: float, idx: int | None = None) -> float:
         """CDF evaluated at price *x*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return float(stats.johnsonsu.cdf(x, a, b, loc=loc, scale=scale))
 
     # ── Vectorised over many observations ─────────────────────────────────────
 
     def ppf_array(self, q: float, y_pred: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """Return PPF at quantile *q* for each (μ_i, σ_i) pair."""
-        return np.array([self.ppf(q, m, s) for m, s in zip(y_pred, sigma)])
+        """Return PPF at quantile *q* for each (μ_i, σ_i) pair.
+
+        When *nu* or *tau* are per-observation arrays each call to
+        :meth:`_params` uses the matching observation index *i*.
+        """
+        return np.array([
+            float(stats.johnsonsu.ppf(q, *self._params(m, s, idx=i)))
+            for i, (m, s) in enumerate(zip(y_pred, sigma))
+        ])
 
     def get_all_intervals(
         self,
@@ -111,19 +131,23 @@ class PredictiveDistribution:
         return result
 
     def describe(self) -> str:
+        nu_val = float(np.mean(self.nu)) if isinstance(self.nu, np.ndarray) else float(self.nu)
+        tau_val = float(np.mean(self.tau)) if isinstance(self.tau, np.ndarray) else float(self.tau)
+        nu_type = " (per-obs)" if isinstance(self.nu, np.ndarray) else ""
+        tau_type = " (per-obs)" if isinstance(self.tau, np.ndarray) else ""
         tail_desc = (
             "heavier than Normal (leptokurtic)"
-            if self.tau < 1.0
+            if tau_val < 1.0
             else "similar to or lighter than Normal"
         )
         skew_desc = (
-            "right-skewed" if self.nu > 0.05
-            else "left-skewed" if self.nu < -0.05
+            "right-skewed" if nu_val > 0.05
+            else "left-skewed" if nu_val < -0.05
             else "approximately symmetric"
         )
         return (
-            f"Johnson SU: ν={self.nu:.4f} ({skew_desc}), "
-            f"τ={self.tau:.4f} ({tail_desc}), "
+            f"Johnson SU: ν={nu_val:.4f}{nu_type} ({skew_desc}), "
+            f"τ={tau_val:.4f}{tau_type} ({tail_desc}), "
             f"loc_std={self.loc_std:.4f}, scale_std={self.scale_std:.4f}"
         )
 

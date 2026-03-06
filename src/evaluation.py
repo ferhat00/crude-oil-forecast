@@ -51,42 +51,62 @@ class PredictiveDistribution:
     while replacing the Normal assumption with a distribution that can
     capture skewness and excess kurtosis in the residuals.
     """
-    nu: float        # skewness parameter (a in scipy)
-    tau: float       # tail-weight parameter (b in scipy); smaller = fatter tails
+    nu: float | np.ndarray  # skewness — scalar (global) or per-observation array
+    tau: float | np.ndarray  # tail-weight — scalar or per-observation array (smaller = fatter tails)
     loc_std: float   # location offset in standardised space
     scale_std: float # scale in standardised space
 
-    # ── Per-observation distribution helpers ─────────────────────────────────
+    # ── Per-observation distribution helpers ────────────────────────────────────
 
-    def _params(self, mu: float, sigma: float) -> tuple:
-        """Return the (a, b, loc, scale) scipy args for one prediction."""
+    def _params(self, mu: float, sigma: float, idx: int | None = None) -> tuple:
+        """Return the (a, b, loc, scale) scipy args for one prediction.
+
+        When *nu* or *tau* are per-observation arrays the observation index
+        *idx* selects the correct value.  When *idx* is None and the fields
+        are arrays their mean is used (suitable for single-date display).
+        """
+        if isinstance(self.nu, np.ndarray):
+            nu_i = float(self.nu[idx]) if idx is not None else float(np.mean(self.nu))
+        else:
+            nu_i = float(self.nu)
+        if isinstance(self.tau, np.ndarray):
+            tau_i = float(self.tau[idx]) if idx is not None else float(np.mean(self.tau))
+        else:
+            tau_i = float(self.tau)
         return (
-            self.nu,
-            self.tau,
+            nu_i,
+            tau_i,
             float(mu) + float(sigma) * self.loc_std,
             float(sigma) * self.scale_std,
         )
 
-    def pdf(self, x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    def pdf(self, x: np.ndarray, mu: float, sigma: float, idx: int | None = None) -> np.ndarray:
         """Evaluate the predictive PDF at price grid *x*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return stats.johnsonsu.pdf(x, a, b, loc=loc, scale=scale)
 
-    def ppf(self, q: float, mu: float, sigma: float) -> float:
+    def ppf(self, q: float, mu: float, sigma: float, idx: int | None = None) -> float:
         """Percent-point function (inverse CDF) at quantile *q*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return float(stats.johnsonsu.ppf(q, a, b, loc=loc, scale=scale))
 
-    def cdf(self, x: float, mu: float, sigma: float) -> float:
+    def cdf(self, x: float, mu: float, sigma: float, idx: int | None = None) -> float:
         """CDF evaluated at price *x*."""
-        a, b, loc, scale = self._params(mu, sigma)
+        a, b, loc, scale = self._params(mu, sigma, idx=idx)
         return float(stats.johnsonsu.cdf(x, a, b, loc=loc, scale=scale))
 
     # ── Vectorised over many observations ─────────────────────────────────────
 
     def ppf_array(self, q: float, y_pred: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """Return PPF at quantile *q* for each (μ_i, σ_i) pair."""
-        return np.array([self.ppf(q, m, s) for m, s in zip(y_pred, sigma)])
+        """Return PPF at quantile *q* for each (μ_i, σ_i) pair.
+
+        When *nu* or *tau* are per-observation arrays each call to
+        :meth:`_params` uses the matching observation index *i*.
+        """
+        return np.array([
+            float(stats.johnsonsu.ppf(q, *self._params(m, s, idx=i)))
+            for i, (m, s) in enumerate(zip(y_pred, sigma))
+        ])
 
     def get_all_intervals(
         self,
@@ -111,19 +131,23 @@ class PredictiveDistribution:
         return result
 
     def describe(self) -> str:
+        nu_val = float(np.mean(self.nu)) if isinstance(self.nu, np.ndarray) else float(self.nu)
+        tau_val = float(np.mean(self.tau)) if isinstance(self.tau, np.ndarray) else float(self.tau)
+        nu_type = " (per-obs)" if isinstance(self.nu, np.ndarray) else ""
+        tau_type = " (per-obs)" if isinstance(self.tau, np.ndarray) else ""
         tail_desc = (
             "heavier than Normal (leptokurtic)"
-            if self.tau < 1.0
+            if tau_val < 1.0
             else "similar to or lighter than Normal"
         )
         skew_desc = (
-            "right-skewed" if self.nu > 0.05
-            else "left-skewed" if self.nu < -0.05
+            "right-skewed" if nu_val > 0.05
+            else "left-skewed" if nu_val < -0.05
             else "approximately symmetric"
         )
         return (
-            f"Johnson SU: ν={self.nu:.4f} ({skew_desc}), "
-            f"τ={self.tau:.4f} ({tail_desc}), "
+            f"Johnson SU: ν={nu_val:.4f}{nu_type} ({skew_desc}), "
+            f"τ={tau_val:.4f}{tau_type} ({tail_desc}), "
             f"loc_std={self.loc_std:.4f}, scale_std={self.scale_std:.4f}"
         )
 
@@ -132,6 +156,7 @@ def fit_residual_distribution(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     sigma: np.ndarray,
+    tau_max: float = 0.8,
 ) -> PredictiveDistribution:
     """Fit a Johnson SU distribution to the standardised model residuals.
 
@@ -144,6 +169,10 @@ def fit_residual_distribution(
         y_true: Observed values.
         y_pred: GAM point predictions (aligned with y_true).
         sigma: Per-observation predictive std deviations (from GAM 95% PI).
+        tau_max: Upper bound on the fitted τ parameter.  Since smaller τ
+            means heavier tails, capping τ prevents MLE from converging to a
+            Gaussian-tailed solution when in-sample residuals look Normal.
+            Default 0.8 guarantees leptokurtic (heavier-than-Normal) tails.
 
     Returns:
         Fitted :class:`PredictiveDistribution`.
@@ -153,12 +182,72 @@ def fit_residual_distribution(
 
     # scipy.stats.johnsonsu.fit returns (a=ν, b=τ, loc, scale)
     nu, tau, loc_std, scale_std = stats.johnsonsu.fit(r_std)
+    tau = min(tau, tau_max)  # enforce fat-tail floor (smaller τ → heavier tails)
 
     dist = PredictiveDistribution(
         nu=nu, tau=tau, loc_std=loc_std, scale_std=scale_std
     )
     logger.info(f"Fitted predictive distribution — {dist.describe()}")
     return dist
+
+
+def calibrate_sigma_scale(
+    gam,
+    X: np.ndarray,
+    y_true: np.ndarray,
+    dist: "PredictiveDistribution",
+    target_coverage: float = 0.90,
+    val_frac: float = 0.2,
+    search_range: tuple[float, float] = (0.5, 5.0),
+    n_steps: int = 100,
+) -> float:
+    """Find the smallest *sigma_scale* that achieves target empirical coverage.
+
+    Uses the most recent ``val_frac`` fraction of the data as a holdout
+    validation set (time-order preserved — no leakage).  Searches linearly
+    over *search_range* and returns the first candidate where the observed
+    proportion of actuals inside the ``target_coverage`` prediction interval
+    meets or exceeds the target.
+
+    Args:
+        gam: Fitted LinearGAM.
+        X: Feature matrix aligned with y_true.
+        y_true: Observed prices.
+        dist: Fitted :class:`PredictiveDistribution` (carries Johnson SU shape).
+        target_coverage: Desired empirical coverage fraction (default: 0.90).
+        val_frac: Fraction of data reserved for validation (default: 0.20).
+        search_range: (min, max) range of sigma_scale values to search.
+        n_steps: Number of candidate values within search_range.
+
+    Returns:
+        Calibrated sigma_scale float.  Falls back to ``search_range[1]`` with
+        a warning if the target cannot be reached within the search range.
+    """
+    n_val = max(int(len(y_true) * val_frac), 30)
+    X_val = X[-n_val:]
+    y_val = y_true[-n_val:]
+    y_pred_val = gam.predict(X_val)
+
+    q_lo = (1.0 - target_coverage) / 2.0
+    q_hi = (1.0 + target_coverage) / 2.0
+
+    for scale in np.linspace(search_range[0], search_range[1], n_steps):
+        sigma_val = get_prediction_sigma(gam, X_val, sigma_scale=scale)
+        lower = dist.ppf_array(q_lo, y_pred_val, sigma_val)
+        upper = dist.ppf_array(q_hi, y_pred_val, sigma_val)
+        coverage = float(np.mean((y_val >= lower) & (y_val <= upper)))
+        if coverage >= target_coverage:
+            logger.info(
+                f"calibrate_sigma_scale: scale={scale:.3f} → "
+                f"empirical {target_coverage * 100:.0f}% coverage = {coverage * 100:.1f}%"
+            )
+            return float(scale)
+
+    logger.warning(
+        f"calibrate_sigma_scale: could not reach {target_coverage * 100:.0f}% coverage "
+        f"within search_range={search_range}. Returning {search_range[1]:.1f}."
+    )
+    return float(search_range[1])
 
 
 # ─────────────────────────────────────────────
@@ -205,7 +294,7 @@ def compare_with_baseline(
 # Prediction Uncertainty Helpers
 # ─────────────────────────────────────────────
 
-def get_prediction_sigma(gam, X: np.ndarray) -> np.ndarray:
+def get_prediction_sigma(gam, X: np.ndarray, sigma_scale: float = 1.0) -> np.ndarray:
     """Derive per-observation predictive standard deviation from the GAM.
 
     pyGAM's prediction intervals assume a Normal predictive distribution:
@@ -220,13 +309,16 @@ def get_prediction_sigma(gam, X: np.ndarray) -> np.ndarray:
     Args:
         gam: Fitted LinearGAM.
         X: Feature matrix (n_samples × n_features).
+        sigma_scale: Multiplicative inflation factor applied to the raw pyGAM
+            sigma.  Values > 1 widen all downstream prediction intervals and
+            PDFs; 1.0 (default) preserves the original behaviour.
 
     Returns:
         Array of shape (n_samples,) with per-observation σ.
     """
     pi_95 = gam.prediction_intervals(X, width=0.95)
     sigma = (pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96)
-    return np.clip(sigma, a_min=1e-6, a_max=None)
+    return np.clip(sigma, a_min=1e-6, a_max=None) * sigma_scale
 
 
 def get_all_prediction_intervals(
@@ -234,6 +326,7 @@ def get_all_prediction_intervals(
     X: np.ndarray,
     widths: list[float] | None = None,
     dist: "PredictiveDistribution | None" = None,
+    sigma_scale: float = 1.0,
 ) -> dict[float, np.ndarray]:
     """Compute prediction intervals at multiple confidence levels.
 
@@ -246,6 +339,8 @@ def get_all_prediction_intervals(
         X: Feature matrix.
         widths: List of PI widths (e.g., [0.50, 0.80, 0.90, 0.95]).
         dist: Optional fitted :class:`PredictiveDistribution`.
+        sigma_scale: Multiplicative inflation factor passed to
+            :func:`get_prediction_sigma`.  Values > 1 widen intervals.
 
     Returns:
         Dict mapping width → array of shape (n_samples, 2) with [lower, upper].
@@ -256,7 +351,7 @@ def get_all_prediction_intervals(
         return {w: gam.prediction_intervals(X, width=w) for w in widths}
 
     y_pred = gam.predict(X)
-    sigma = get_prediction_sigma(gam, X)
+    sigma = get_prediction_sigma(gam, X, sigma_scale=sigma_scale)
     return dist.get_all_intervals(y_pred, sigma, widths)
 
 

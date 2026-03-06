@@ -26,12 +26,20 @@ from app.components import (
 from src.config_loader import load_config
 from src.evaluation import (
     PredictiveDistribution,
+    calibrate_sigma_scale,
     compute_metrics,
     fit_residual_distribution,
     get_prediction_sigma,
     naive_baseline_predictions,
 )
-from src.model import build_feature_matrix, load_feature_names, load_model
+from src.model import (
+    _classify_feature,
+    build_feature_matrix,
+    load_all_models,
+    load_feature_names,
+    load_model,
+    get_sigma_from_sigma_gam,
+)
 
 
 @st.cache_data
@@ -41,7 +49,21 @@ def load_data(root: str) -> pd.DataFrame:
 
 @st.cache_resource
 def load_gam_model(root: str):
+    """Load the mu GAM (backward-compatible single model)."""
     return load_model(Path(root) / "outputs" / "models" / "gam_model.pkl")
+
+
+@st.cache_resource
+def load_all_gam_models_cached(root: str) -> dict:
+    """Load all distributional sub-models (mu, sigma, nu, tau) from gam_models.pkl.
+
+    Falls back to wrapping the legacy gam_model.pkl with key ``\"mu\"`` if the
+    joint file does not yet exist (pre-retrain scenario).
+    """
+    models_path = Path(root) / "outputs" / "models" / "gam_models.pkl"
+    if models_path.exists():
+        return load_all_models(models_path)
+    return {"mu": load_model(Path(root) / "outputs" / "models" / "gam_model.pkl")}
 
 
 @st.cache_data
@@ -49,13 +71,92 @@ def load_features(root: str) -> list[str]:
     return load_feature_names(Path(root) / "outputs" / "models" / "feature_names.pkl")
 
 
-@st.cache_resource
-def build_predictive_dist(root: str, _gam) -> PredictiveDistribution:
-    """Fit Johnson SU predictive distribution from in-sample residuals.
+@st.cache_data
+def load_sub_feature_names(root: str) -> dict[str, list[str]]:
+    """Load feature name lists for the sigma, nu, and tau sub-models."""
+    base = Path(root) / "outputs" / "models"
+    result: dict[str, list[str]] = {}
+    for param in ("sigma", "nu", "tau"):
+        path = base / f"{param}_feature_names.pkl"
+        if path.exists():
+            result[param] = load_feature_names(path)
+    return result
 
-    The leading underscore on ``_gam`` prevents Streamlit from attempting to
-    hash the model object (which would fail); the distribution is keyed only
-    on ``root``.  Call this after loading the model so the cache key is stable.
+
+@st.cache_resource
+def build_predictive_dist(
+    root: str,
+    _gam,
+    _models: dict | None = None,
+) -> PredictiveDistribution:
+    """Fit Johnson SU predictive distribution, incorporating sub-models when available.
+
+    * **Sigma**: If a sigma sub-model is present the per-observation σ is computed
+      via ``exp(sigma_gam.predict(X_sigma))`` instead of the GAM 95% PI width.
+    * **Nu / Tau**: If nu/tau sub-models are present the shape parameters become
+      per-observation arrays from model predictions.  Otherwise globally fitted
+      scalars are used (original behaviour).
+
+    The leading underscore on ``_gam`` / ``_models`` prevents Streamlit from
+    attempting to hash these objects; the result is keyed only on ``root``.
+    """
+    df = load_data(root)
+    cfg = load_config()
+    target = cfg["features"]["target"]
+    feature_names = load_features(root)
+    sub_names = load_sub_feature_names(root)
+
+    X_full, y, all_names = build_feature_matrix(df, target)
+    name_to_idx = {n: i for i, n in enumerate(all_names)}
+    col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
+    X = X_full[:, col_idx]
+    y_pred = _gam.predict(X)
+
+    # ── Sigma ─────────────────────────────────────────────────────────────────
+    if _models and "sigma" in _models and "sigma" in sub_names:
+        sigma_col = [feature_names.index(n) for n in sub_names["sigma"] if n in feature_names]
+        X_sigma = X[:, sigma_col]
+        sigma = get_sigma_from_sigma_gam(_models["sigma"], X_sigma)
+    else:
+        sigma = get_prediction_sigma(_gam, X)
+
+    # ── Fit Johnson SU on standardised residuals ───────────────────────────────
+    dist = fit_residual_distribution(y, y_pred, sigma)
+
+    # ── Override nu/tau with per-observation model predictions if available ────
+    if _models and "nu" in _models and "nu" in sub_names:
+        nu_col = [feature_names.index(n) for n in sub_names["nu"] if n in feature_names]
+        X_nu = X[:, nu_col]
+        nu_arr = np.clip(_models["nu"].predict(X_nu), -10.0, 10.0)
+        dist = PredictiveDistribution(
+            nu=nu_arr, tau=dist.tau,
+            loc_std=dist.loc_std, scale_std=dist.scale_std,
+        )
+
+    if _models and "tau" in _models and "tau" in sub_names:
+        tau_col = [feature_names.index(n) for n in sub_names["tau"] if n in feature_names]
+        X_tau = X[:, tau_col]
+        tau_arr = np.clip(_models["tau"].predict(X_tau), 0.1, 0.9)
+        dist = PredictiveDistribution(
+            nu=dist.nu, tau=tau_arr,
+            loc_std=dist.loc_std, scale_std=dist.scale_std,
+        )
+
+    return dist
+
+
+@st.cache_data
+def compute_calibrated_sigma_scale(
+    root: str,
+    _gam,
+    _dist: PredictiveDistribution,
+    target_coverage: float = 0.90,
+) -> float:
+    """Auto-calibrate sigma_scale so empirical coverage matches *target_coverage*.
+
+    The leading underscores on ``_gam`` and ``_dist`` prevent Streamlit from
+    attempting to hash those objects; the result is keyed only on ``root`` and
+    ``target_coverage``.
     """
     df = load_data(root)
     cfg = load_config()
@@ -63,12 +164,45 @@ def build_predictive_dist(root: str, _gam) -> PredictiveDistribution:
     feature_names = load_features(root)
     X_full, y, all_names = build_feature_matrix(df, target)
     name_to_idx = {n: i for i, n in enumerate(all_names)}
-    col_idx = [name_to_idx[n] for n in feature_names]
+    col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
-    y_pred = _gam.predict(X)
-    sigma = get_prediction_sigma(_gam, X)
-    return fit_residual_distribution(y, y_pred, sigma)
+    return calibrate_sigma_scale(_gam, X, y, _dist, target_coverage=target_coverage)
 
+
+def build_feature_importance_df(gam, feature_names: list[str]) -> pd.DataFrame:
+    """Build a feature significance table from pyGAM model statistics.
+
+    Columns: Feature, Type (l / s / cyclic), p-value, EDoF, λ.
+    Sorted ascending by p-value so the most significant features appear first.
+
+    Args:
+        gam: Fitted LinearGAM with populated ``.statistics_``.
+        feature_names: Column names (must match the number of non-intercept terms).
+
+    Returns:
+        DataFrame sorted by p-value ascending.
+    """
+    stats_dict = gam.statistics_
+    n = len(feature_names)
+
+    p_values_raw = list(stats_dict.get("p_values", []))
+    edof_raw = list(stats_dict.get("edof_per_term", []))
+    lam_raw = list(np.array(gam.lam).flatten())
+
+    rows = []
+    for i, name in enumerate(feature_names):
+        cat = _classify_feature(name)
+        type_label = {"linear": "l()", "cyclic": "s(cp)", "rolling": "s()", "lag": "s()",
+                      "return": "s()", "spline": "s()"}.get(cat, "s()")
+        rows.append({
+            "Feature": name,
+            "Type": type_label,
+            "p-value": float(p_values_raw[i]) if i < len(p_values_raw) else float("nan"),
+            "EDoF": float(edof_raw[i]) if i < len(edof_raw) else float("nan"),
+            "\u03bb": float(lam_raw[i]) if i < len(lam_raw) else float("nan"),
+        })
+    df = pd.DataFrame(rows).sort_values("p-value").reset_index(drop=True)
+    return df
 
 
 def main():
@@ -100,13 +234,24 @@ def main():
     # Restrict to the columns the model was trained on (stepwise may have
     # dropped features; saved feature_names reflects the final selection).
     name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
-    col_idx = [name_to_idx[n] for n in feature_names]
+    col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
 
-    # Pre-compute predictions, sigma, and Johnson SU distribution once
+    # Load distributional sub-models (sigma, nu, tau) if available
+    all_models = load_all_gam_models_cached(root)
+    sub_names = load_sub_feature_names(root)
+
+    # Build sigma-sub-model feature matrix for use in components
+    sigma_gam_model = all_models.get("sigma")
+    if sigma_gam_model is not None and "sigma" in sub_names:
+        sigma_col_idx = [feature_names.index(n) for n in sub_names["sigma"] if n in feature_names]
+        X_sigma = X[:, sigma_col_idx]
+    else:
+        sigma_gam_model, X_sigma = None, None
+
+    # Pre-compute predictions and fit Johnson SU distribution once
     y_pred = gam.predict(X)
-    sigma = _get_sigma_from_gam(gam, X)
-    dist = build_predictive_dist(root, gam)  # cached Johnson SU fit
+    dist = build_predictive_dist(root, gam, _models=all_models)  # cached
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     st.sidebar.header("Settings")
@@ -133,20 +278,51 @@ def main():
     # Show fitted distribution parameters in sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Predictive Distribution**")
-    st.sidebar.markdown(
-        f"Johnson SU fitted to in-sample residuals  \n"
-        f"ν = {dist.nu:.3f} (skewness)  \n"
-        f"τ = {dist.tau:.3f} (tail weight)  \n"
-        f"{'Heavier tails than Normal' if dist.tau < 1 else 'Similar/lighter tails than Normal'}"
+    nu_val = dist.nu
+    tau_val = dist.tau
+    if isinstance(nu_val, np.ndarray):
+        st.sidebar.markdown(
+            f"Johnson SU — **per-observation** ν and τ  \n"
+            f"ν range: [{nu_val.min():.3f}, {nu_val.max():.3f}]  (mean {nu_val.mean():.3f})  \n"
+            f"τ range: [{tau_val.min():.3f}, {tau_val.max():.3f}]  (mean {tau_val.mean():.3f})  \n"
+            f"σ source: {'sigma sub-model' if sigma_gam_model is not None else 'PI width'}"
+        )
+    else:
+        st.sidebar.markdown(
+            f"Johnson SU fitted to in-sample residuals  \n"
+            f"ν = {float(nu_val):.3f} (skewness)  \n"
+            f"τ = {float(tau_val):.3f} (tail weight)  \n"
+            f"{'Heavier tails than Normal' if float(tau_val) < 1 else 'Similar/lighter tails than Normal'}"
+        )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Uncertainty Scaling**")
+    sigma_scale_auto = compute_calibrated_sigma_scale(root, gam, dist)
+    sigma_scale = st.sidebar.slider(
+        "σ scale  (auto-calibrated default)",
+        min_value=0.5, max_value=5.0,
+        value=round(sigma_scale_auto * 10) / 10,
+        step=0.1,
+        help=(
+            "Multiplies the predictive σ.  "
+            "Default is auto-calibrated to achieve empirical 90% coverage "
+            "on the most recent 20% of in-sample data."
+        ),
     )
+    st.sidebar.caption(f"Auto-calibrated value: {sigma_scale_auto:.2f}×")
 
+    # Recompute sigma using the user-chosen scale factor
+    sigma = _get_sigma_from_gam(
+        gam, X, sigma_scale=sigma_scale,
+        sigma_gam=sigma_gam_model, X_sigma=X_sigma,
+    )
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Price Overview",
         "Model Performance",
         "Probability Forecast",
         "Partial Dependence",
         "What-If Analysis",
+        "Model Terms",
     ])
 
     # ── Tab 1: Price Overview ─────────────────────────────────────────────────
@@ -231,6 +407,7 @@ def main():
                     df.index, y, y_pred, gam, X,
                     last_n_days=fan_days,
                     dist=dist,
+                    sigma_scale=sigma_scale,
                 ),
                 use_container_width=True,
             )
@@ -275,8 +452,10 @@ def main():
 
             # Summary stats — use Johnson SU CDF when available, else Normal
             if dist is not None:
-                pctile = float(dist.cdf(actual_sel, mu_sel, sigma_sel) * 100)
-                dist_note = f"ν={dist.nu:.2f}, τ={dist.tau:.2f}"
+                pctile = float(dist.cdf(actual_sel, mu_sel, sigma_sel, idx=idx) * 100)
+                _nu_disp = float(dist.nu[idx]) if isinstance(dist.nu, np.ndarray) else float(dist.nu)
+                _tau_disp = float(dist.tau[idx]) if isinstance(dist.tau, np.ndarray) else float(dist.tau)
+                dist_note = f"ν={_nu_disp:.2f}, τ={_tau_disp:.2f}"
             else:
                 pctile = float(stats_norm_cdf(actual_sel, mu_sel, sigma_sel) * 100)
                 dist_note = "Normal"
@@ -320,7 +499,7 @@ def main():
 
         base_X = X[-1:].copy()
         current_pred = gam.predict(base_X)[0]
-        current_sigma = float(_get_sigma_from_gam(gam, base_X)[0])
+        current_sigma = float(_get_sigma_from_gam(gam, base_X, sigma_scale=sigma_scale)[0])
 
         st.metric("Current Predicted Price", f"${current_pred:.2f}",
                   help=f"σ = ${current_sigma:.2f}")
@@ -355,6 +534,7 @@ def main():
                     plot_what_if_analysis(
                         gam, base_X, feat_idx, vary_range, whatif_feature,
                         dist=dist,
+                        sigma_scale=sigma_scale,
                     ),
                     use_container_width=True,
                 )
@@ -379,7 +559,7 @@ def main():
                 X_s = base_X.copy()
                 X_s[0, feat_idx] = val
                 p = float(gam.predict(X_s)[0])
-                sig = float(_get_sigma_from_gam(gam, X_s)[0])
+                sig = float(_get_sigma_from_gam(gam, X_s, sigma_scale=sigma_scale)[0])
                 if dist is not None:
                     lo95 = dist.ppf(0.025, p, sig)
                     hi95 = dist.ppf(0.975, p, sig)
@@ -388,6 +568,66 @@ def main():
                     pi_str = f"σ=${sig:.2f}"
                 label = f"{'+' if pct > 0 else ''}{int(pct*100)}%  ({val:.2f})" if pct != 0 else "Current"
                 col.metric(label, f"${p:.2f}", pi_str)
+
+    # ── Tab 6: Model Terms ────────────────────────────────────────────────────
+    with tab6:
+        st.subheader("Distributional Model Terms — Feature Significance")
+        st.markdown(
+            "All four distributional sub-models are shown below, sorted by **p-value** "
+            "(low = significant).  Red p-values (< 0.05) indicate terms that contribute "
+            "significantly to that distribution parameter.  EDoF ≈ 1 means the term is "
+            "nearly linear; higher values indicate non-linear curvature.  "
+            "λ is the smoothing penalty (higher = smoother / less flexible)."
+        )
+
+        _PARAM_LABELS = {
+            "mu":    ("μ — Location (price level)",     "mu",    gam,         feature_names),
+            "sigma": ("σ — Scale (conditional volatility)", "sigma", None, None),
+            "nu":    ("ν — Skewness",                   "nu",    None, None),
+            "tau":   ("τ — Tail weight",                "tau",   None, None),
+        }
+
+        # Inject sub-models from all_models into the label table
+        for _pk in ("sigma", "nu", "tau"):
+            _sub_gam = all_models.get(_pk)
+            _sub_names = sub_names.get(_pk)
+            _lbl, _key, _, _ = _PARAM_LABELS[_pk]
+            _PARAM_LABELS[_pk] = (_lbl, _key, _sub_gam, _sub_names)
+
+        for _param_key in ("mu", "sigma", "nu", "tau"):
+            _lbl, _pk, _sub_gam, _sub_names = _PARAM_LABELS[_param_key]
+            st.markdown(f"#### {_lbl}")
+
+            if _sub_gam is None or _sub_names is None:
+                st.info(
+                    f"No {_param_key} sub-model found. Re-run the pipeline to generate it."
+                )
+                continue
+
+            try:
+                _df_imp = build_feature_importance_df(_sub_gam, _sub_names)
+                n_terms = len(_df_imp)
+                low_p = _df_imp["p-value"].min()
+                st.caption(
+                    f"{n_terms} term{'s' if n_terms != 1 else ''} retained  |  "
+                    f"lowest p-value: {low_p:.4f}"
+                )
+
+                # Style: highlight significant rows (p < 0.05) in light red
+                def _highlight_sig(row):
+                    pv = row.get("p-value", 1.0)
+                    color = "background-color: #ffe0e0" if (not pd.isna(pv) and pv < 0.05) else ""
+                    return [color] * len(row)
+
+                st.dataframe(
+                    _df_imp.style
+                        .apply(_highlight_sig, axis=1)
+                        .format({"p-value": "{:.4f}", "EDoF": "{:.2f}", "λ": "{:.4f}"}),
+                    use_container_width=True,
+                    height=min(400, 36 + n_terms * 35),
+                )
+            except Exception as _e:
+                st.warning(f"Could not build {_param_key} terms table: {_e}")
 
 
 # ── Helper imported inline to avoid circular deps ────────────────────────────

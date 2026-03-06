@@ -22,10 +22,27 @@ _CI_FILL_RGBA = [
 _CI_LINE_RGBA = ["rgba(0,0,0,0)"] * 4   # invisible borders between bands
 
 
-def _get_sigma_from_gam(gam: LinearGAM, X: np.ndarray) -> np.ndarray:
-    """Back out per-observation predictive σ from the 95% PI."""
+def _get_sigma_from_gam(
+    gam: LinearGAM,
+    X: np.ndarray,
+    sigma_scale: float = 1.0,
+    sigma_gam: LinearGAM | None = None,
+    X_sigma: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-observation predictive σ from sigma_gam (preferred) or PI width (fallback).
+
+    When *sigma_gam* and *X_sigma* are provided the sigma sub-model is used::
+
+        σ = exp(sigma_gam.predict(X_sigma)) × sigma_scale
+
+    Otherwise falls back to backing out σ from the GAM 95% PI::
+
+        σ = (upper_95 − lower_95) / (2 × 1.96) × sigma_scale
+    """
+    if sigma_gam is not None and X_sigma is not None:
+        return np.clip(np.exp(sigma_gam.predict(X_sigma)), 1e-6, None) * sigma_scale
     pi_95 = gam.prediction_intervals(X, width=0.95)
-    return np.clip((pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96), 1e-6, None)
+    return np.clip((pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96), 1e-6, None) * sigma_scale
 
 
 def _get_intervals(
@@ -76,6 +93,7 @@ def plot_fan_chart_plotly(
     widths: list[float] | None = None,
     last_n_days: int = 500,
     dist: PredictiveDistribution | None = None,
+    sigma_scale: float = 1.0,
 ) -> go.Figure:
     """Interactive fan chart with layered confidence bands in shades of blue.
 
@@ -92,6 +110,7 @@ def plot_fan_chart_plotly(
         widths: CI levels to draw (default: 50/80/90/95%).
         last_n_days: Show only the most recent N trading days.
         dist: Optional :class:`~src.evaluation.PredictiveDistribution`.
+        sigma_scale: Multiplicative inflation factor for pyGAM's raw σ.
 
     Returns:
         Plotly Figure.
@@ -105,7 +124,7 @@ def plot_fan_chart_plotly(
     y_pred_n = y_pred[-n:]
     X_n = X[-n:]
 
-    sigma_n = _get_sigma_from_gam(gam, X_n)
+    sigma_n = _get_sigma_from_gam(gam, X_n, sigma_scale=sigma_scale)
     intervals = _get_intervals(gam, X_n, y_pred_n, sigma_n, widths, dist)
 
     dist_tag = " (Johnson SU)" if dist is not None else " (Gaussian)"
@@ -356,13 +375,14 @@ def plot_what_if_analysis(
     vary_range: np.ndarray,
     feature_name: str,
     dist: PredictiveDistribution | None = None,
+    sigma_scale: float = 1.0,
 ) -> go.Figure:
     """Predicted price as one feature sweeps across a range, with CI band.
 
     If *dist* is provided the 95% CI uses Johnson SU quantiles.
     """
     predictions, ci_lower, ci_upper = [], [], []
-    sigma_base = _get_sigma_from_gam(gam, base_X)
+    sigma_base = _get_sigma_from_gam(gam, base_X, sigma_scale=sigma_scale)
 
     for val in vary_range:
         X_mod = base_X.copy()
@@ -371,7 +391,7 @@ def plot_what_if_analysis(
         predictions.append(mu_val)
 
         if dist is not None:
-            sig_val = float(_get_sigma_from_gam(gam, X_mod)[0])
+            sig_val = float(_get_sigma_from_gam(gam, X_mod, sigma_scale=sigma_scale)[0])
             ci_lower.append(dist.ppf(0.025, mu_val, sig_val))
             ci_upper.append(dist.ppf(0.975, mu_val, sig_val))
         else:

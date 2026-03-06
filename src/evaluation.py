@@ -132,6 +132,7 @@ def fit_residual_distribution(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     sigma: np.ndarray,
+    tau_max: float = 0.8,
 ) -> PredictiveDistribution:
     """Fit a Johnson SU distribution to the standardised model residuals.
 
@@ -144,6 +145,10 @@ def fit_residual_distribution(
         y_true: Observed values.
         y_pred: GAM point predictions (aligned with y_true).
         sigma: Per-observation predictive std deviations (from GAM 95% PI).
+        tau_max: Upper bound on the fitted τ parameter.  Since smaller τ
+            means heavier tails, capping τ prevents MLE from converging to a
+            Gaussian-tailed solution when in-sample residuals look Normal.
+            Default 0.8 guarantees leptokurtic (heavier-than-Normal) tails.
 
     Returns:
         Fitted :class:`PredictiveDistribution`.
@@ -153,12 +158,72 @@ def fit_residual_distribution(
 
     # scipy.stats.johnsonsu.fit returns (a=ν, b=τ, loc, scale)
     nu, tau, loc_std, scale_std = stats.johnsonsu.fit(r_std)
+    tau = min(tau, tau_max)  # enforce fat-tail floor (smaller τ → heavier tails)
 
     dist = PredictiveDistribution(
         nu=nu, tau=tau, loc_std=loc_std, scale_std=scale_std
     )
     logger.info(f"Fitted predictive distribution — {dist.describe()}")
     return dist
+
+
+def calibrate_sigma_scale(
+    gam,
+    X: np.ndarray,
+    y_true: np.ndarray,
+    dist: "PredictiveDistribution",
+    target_coverage: float = 0.90,
+    val_frac: float = 0.2,
+    search_range: tuple[float, float] = (0.5, 5.0),
+    n_steps: int = 100,
+) -> float:
+    """Find the smallest *sigma_scale* that achieves target empirical coverage.
+
+    Uses the most recent ``val_frac`` fraction of the data as a holdout
+    validation set (time-order preserved — no leakage).  Searches linearly
+    over *search_range* and returns the first candidate where the observed
+    proportion of actuals inside the ``target_coverage`` prediction interval
+    meets or exceeds the target.
+
+    Args:
+        gam: Fitted LinearGAM.
+        X: Feature matrix aligned with y_true.
+        y_true: Observed prices.
+        dist: Fitted :class:`PredictiveDistribution` (carries Johnson SU shape).
+        target_coverage: Desired empirical coverage fraction (default: 0.90).
+        val_frac: Fraction of data reserved for validation (default: 0.20).
+        search_range: (min, max) range of sigma_scale values to search.
+        n_steps: Number of candidate values within search_range.
+
+    Returns:
+        Calibrated sigma_scale float.  Falls back to ``search_range[1]`` with
+        a warning if the target cannot be reached within the search range.
+    """
+    n_val = max(int(len(y_true) * val_frac), 30)
+    X_val = X[-n_val:]
+    y_val = y_true[-n_val:]
+    y_pred_val = gam.predict(X_val)
+
+    q_lo = (1.0 - target_coverage) / 2.0
+    q_hi = (1.0 + target_coverage) / 2.0
+
+    for scale in np.linspace(search_range[0], search_range[1], n_steps):
+        sigma_val = get_prediction_sigma(gam, X_val, sigma_scale=scale)
+        lower = dist.ppf_array(q_lo, y_pred_val, sigma_val)
+        upper = dist.ppf_array(q_hi, y_pred_val, sigma_val)
+        coverage = float(np.mean((y_val >= lower) & (y_val <= upper)))
+        if coverage >= target_coverage:
+            logger.info(
+                f"calibrate_sigma_scale: scale={scale:.3f} → "
+                f"empirical {target_coverage * 100:.0f}% coverage = {coverage * 100:.1f}%"
+            )
+            return float(scale)
+
+    logger.warning(
+        f"calibrate_sigma_scale: could not reach {target_coverage * 100:.0f}% coverage "
+        f"within search_range={search_range}. Returning {search_range[1]:.1f}."
+    )
+    return float(search_range[1])
 
 
 # ─────────────────────────────────────────────
@@ -205,7 +270,7 @@ def compare_with_baseline(
 # Prediction Uncertainty Helpers
 # ─────────────────────────────────────────────
 
-def get_prediction_sigma(gam, X: np.ndarray) -> np.ndarray:
+def get_prediction_sigma(gam, X: np.ndarray, sigma_scale: float = 1.0) -> np.ndarray:
     """Derive per-observation predictive standard deviation from the GAM.
 
     pyGAM's prediction intervals assume a Normal predictive distribution:
@@ -220,13 +285,16 @@ def get_prediction_sigma(gam, X: np.ndarray) -> np.ndarray:
     Args:
         gam: Fitted LinearGAM.
         X: Feature matrix (n_samples × n_features).
+        sigma_scale: Multiplicative inflation factor applied to the raw pyGAM
+            sigma.  Values > 1 widen all downstream prediction intervals and
+            PDFs; 1.0 (default) preserves the original behaviour.
 
     Returns:
         Array of shape (n_samples,) with per-observation σ.
     """
     pi_95 = gam.prediction_intervals(X, width=0.95)
     sigma = (pi_95[:, 1] - pi_95[:, 0]) / (2 * 1.96)
-    return np.clip(sigma, a_min=1e-6, a_max=None)
+    return np.clip(sigma, a_min=1e-6, a_max=None) * sigma_scale
 
 
 def get_all_prediction_intervals(
@@ -234,6 +302,7 @@ def get_all_prediction_intervals(
     X: np.ndarray,
     widths: list[float] | None = None,
     dist: "PredictiveDistribution | None" = None,
+    sigma_scale: float = 1.0,
 ) -> dict[float, np.ndarray]:
     """Compute prediction intervals at multiple confidence levels.
 
@@ -246,6 +315,8 @@ def get_all_prediction_intervals(
         X: Feature matrix.
         widths: List of PI widths (e.g., [0.50, 0.80, 0.90, 0.95]).
         dist: Optional fitted :class:`PredictiveDistribution`.
+        sigma_scale: Multiplicative inflation factor passed to
+            :func:`get_prediction_sigma`.  Values > 1 widen intervals.
 
     Returns:
         Dict mapping width → array of shape (n_samples, 2) with [lower, upper].
@@ -256,7 +327,7 @@ def get_all_prediction_intervals(
         return {w: gam.prediction_intervals(X, width=w) for w in widths}
 
     y_pred = gam.predict(X)
-    sigma = get_prediction_sigma(gam, X)
+    sigma = get_prediction_sigma(gam, X, sigma_scale=sigma_scale)
     return dist.get_all_intervals(y_pred, sigma, widths)
 
 

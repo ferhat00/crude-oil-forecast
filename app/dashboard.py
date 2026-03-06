@@ -26,6 +26,7 @@ from app.components import (
 from src.config_loader import load_config
 from src.evaluation import (
     PredictiveDistribution,
+    calibrate_sigma_scale,
     compute_metrics,
     fit_residual_distribution,
     get_prediction_sigma,
@@ -70,6 +71,29 @@ def build_predictive_dist(root: str, _gam) -> PredictiveDistribution:
     return fit_residual_distribution(y, y_pred, sigma)
 
 
+@st.cache_data
+def compute_calibrated_sigma_scale(
+    root: str,
+    _gam,
+    _dist: PredictiveDistribution,
+    target_coverage: float = 0.90,
+) -> float:
+    """Auto-calibrate sigma_scale so empirical coverage matches *target_coverage*.
+
+    The leading underscores on ``_gam`` and ``_dist`` prevent Streamlit from
+    attempting to hash those objects; the result is keyed only on ``root`` and
+    ``target_coverage``.
+    """
+    df = load_data(root)
+    cfg = load_config()
+    target = cfg["features"]["target"]
+    feature_names = load_features(root)
+    X_full, y, all_names = build_feature_matrix(df, target)
+    name_to_idx = {n: i for i, n in enumerate(all_names)}
+    col_idx = [name_to_idx[n] for n in feature_names]
+    X = X_full[:, col_idx]
+    return calibrate_sigma_scale(_gam, X, y, _dist, target_coverage=target_coverage)
+
 
 def main():
     st.set_page_config(
@@ -103,9 +127,8 @@ def main():
     col_idx = [name_to_idx[n] for n in feature_names]
     X = X_full[:, col_idx]
 
-    # Pre-compute predictions, sigma, and Johnson SU distribution once
+    # Pre-compute predictions and fit Johnson SU distribution once
     y_pred = gam.predict(X)
-    sigma = _get_sigma_from_gam(gam, X)
     dist = build_predictive_dist(root, gam)  # cached Johnson SU fit
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
@@ -139,7 +162,25 @@ def main():
         f"τ = {dist.tau:.3f} (tail weight)  \n"
         f"{'Heavier tails than Normal' if dist.tau < 1 else 'Similar/lighter tails than Normal'}"
     )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Uncertainty Scaling**")
+    sigma_scale_auto = compute_calibrated_sigma_scale(root, gam, dist)
+    sigma_scale = st.sidebar.slider(
+        "σ scale  (auto-calibrated default)",
+        min_value=0.5, max_value=5.0,
+        value=round(sigma_scale_auto * 10) / 10,
+        step=0.1,
+        help=(
+            "Multiplies pyGAM's raw prediction-interval width.  "
+            "1.0 = raw pyGAM output (narrow).  "
+            "Default is auto-calibrated to achieve empirical 90% coverage "
+            "on the most recent 20% of in-sample data."
+        ),
+    )
+    st.sidebar.caption(f"Auto-calibrated value: {sigma_scale_auto:.2f}×")
 
+    # Recompute sigma using the user-chosen scale factor
+    sigma = _get_sigma_from_gam(gam, X, sigma_scale=sigma_scale)
     # ── Tabs ─────────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Price Overview",
@@ -231,6 +272,7 @@ def main():
                     df.index, y, y_pred, gam, X,
                     last_n_days=fan_days,
                     dist=dist,
+                    sigma_scale=sigma_scale,
                 ),
                 use_container_width=True,
             )
@@ -320,7 +362,7 @@ def main():
 
         base_X = X[-1:].copy()
         current_pred = gam.predict(base_X)[0]
-        current_sigma = float(_get_sigma_from_gam(gam, base_X)[0])
+        current_sigma = float(_get_sigma_from_gam(gam, base_X, sigma_scale=sigma_scale)[0])
 
         st.metric("Current Predicted Price", f"${current_pred:.2f}",
                   help=f"σ = ${current_sigma:.2f}")
@@ -355,6 +397,7 @@ def main():
                     plot_what_if_analysis(
                         gam, base_X, feat_idx, vary_range, whatif_feature,
                         dist=dist,
+                        sigma_scale=sigma_scale,
                     ),
                     use_container_width=True,
                 )
@@ -379,7 +422,7 @@ def main():
                 X_s = base_X.copy()
                 X_s[0, feat_idx] = val
                 p = float(gam.predict(X_s)[0])
-                sig = float(_get_sigma_from_gam(gam, X_s)[0])
+                sig = float(_get_sigma_from_gam(gam, X_s, sigma_scale=sigma_scale)[0])
                 if dist is not None:
                     lo95 = dist.ppf(0.025, p, sig)
                     hi95 = dist.ppf(0.975, p, sig)

@@ -89,3 +89,4 @@ model:
   embargo_days: 200         # Obs to drop between train/test boundary (= max rolling window)
   stepwise_selection: true  # Backward AIC elimination to drop irrelevant/redundant features
   stepwise_max_steps: 50    # Max elimination iterations (null = unlimited)
+  n_jobs: -1                # Parallel workers: -1 = all logical CPUs, 1 = sequential

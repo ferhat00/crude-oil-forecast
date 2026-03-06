@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Generator
 
 import joblib
+from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
 from pygam import LinearGAM, l, s
@@ -222,19 +223,82 @@ class EmbargoedTimeSeriesSplit:
         return self.n_splits
 
 
+# ─────────────────────────────────────────────
+# Module-level workers (must be picklable by loky)
+# ─────────────────────────────────────────────
+
+def _fit_one_lam(
+    lam_val: float,
+    terms: object,
+    X: np.ndarray,
+    y: np.ndarray,
+) -> tuple[float, "LinearGAM"]:
+    """Fit a LinearGAM with a single fixed lambda; return (GCV, gam).
+
+    pyGAM broadcasts a scalar lam to all terms automatically.
+    """
+    gam = LinearGAM(terms, lam=lam_val)
+    gam.fit(X, y)
+    return float(gam.statistics_["GCV"]), gam
+
+
+def _fit_fold_worker(
+    fold_num: int,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
+    terms: object,
+    lam_values: list[float],
+) -> dict:
+    """Fit one CV fold and return metrics + deferred log lines.
+
+    Calls fit_gam with n_jobs=1 to avoid nested parallelism.
+    Log lines are returned as strings so the main process can emit them
+    in fold order after all workers complete.
+    """
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    gam = fit_gam(X_train, y_train, terms, lam_values, n_jobs=1)
+    y_pred = gam.predict(X_test)
+
+    mae = float(np.mean(np.abs(y_test - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
+    mape = float(np.mean(np.abs((y_test - y_pred) / y_test)) * 100)
+
+    log_lines = [
+        f"  Fold {fold_num}: train={len(train_idx)} obs, test={len(test_idx)} obs (after embargo)",
+        f"  Fold {fold_num}: MAE={mae:.2f}, RMSE={rmse:.2f}, MAPE={mape:.2f}%",
+    ]
+    return {
+        "fold": fold_num,
+        "train_size": len(train_idx),
+        "test_size": len(test_idx),
+        "mae": mae,
+        "rmse": rmse,
+        "mape": mape,
+        "log_lines": log_lines,
+    }
+
+
 def fit_gam(
     X: np.ndarray,
     y: np.ndarray,
     terms: object,
     lam_values: list[float] | None = None,
+    n_jobs: int = 1,
 ) -> LinearGAM:
-    """Fit a LinearGAM with automatic lambda tuning via grid search.
+    """Fit a LinearGAM with lambda tuning via parallel grid search.
 
     Args:
         X: Feature matrix.
         y: Target vector.
         terms: pyGAM terms expression from define_gam_terms.
         lam_values: List of lambda values for grid search. If None, uses logspace.
+        n_jobs: Number of parallel jobs for the lambda grid search.
+            1 = sequential (default, safe for nested calls).
+            -1 = use all logical CPUs.
 
     Returns:
         Fitted LinearGAM model.
@@ -242,10 +306,13 @@ def fit_gam(
     if lam_values is None:
         lam_values = np.logspace(-3, 3, 11).tolist()
 
-    gam = LinearGAM(terms)
-    gam.gridsearch(X, y, lam=np.logspace(-3, 3, 11))
+    results: list[tuple[float, LinearGAM]] = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_fit_one_lam)(lam, terms, X, y) for lam in lam_values
+    )
 
-    logger.info(f"GAM fitted. GCV score: {gam.statistics_['GCV']:.4f}")
+    best_gcv, gam = min(results, key=lambda r: r[0])
+
+    logger.info(f"GAM fitted. GCV score: {best_gcv:.4f}")
     logger.info(f"Pseudo R-squared: {gam.statistics_['pseudo_r2']['explained_deviance']:.4f}")
 
     return gam
@@ -258,6 +325,7 @@ def cross_validate(
     n_splits: int = 5,
     embargo_days: int = 200,
     lam_values: list[float] | None = None,
+    n_jobs: int = 1,
 ) -> dict:
     """Perform embargoed time series cross-validation.
 
@@ -265,6 +333,9 @@ def cross_validate(
     1. We always predict future from past (no temporal leakage).
     2. Rolling/lag features computed on the full dataset do not bleed
        training-period information into test observations at fold boundaries.
+
+    Folds are fitted in parallel when ``n_jobs != 1``.  Each fold worker
+    calls ``fit_gam`` with ``n_jobs=1`` to avoid nested parallelism.
 
     Args:
         X: Feature matrix.
@@ -275,45 +346,48 @@ def cross_validate(
             Should equal the largest rolling window used in feature engineering
             (default 200 = the 200-day SMA window).
         lam_values: Lambda values for grid search.
+        n_jobs: Number of parallel jobs for fold fitting.
+            1 = sequential (default).  -1 = all logical CPUs.
 
     Returns:
         Dict with fold_metrics, mean_mae, mean_rmse, mean_mape, embargo_days.
     """
+    if lam_values is None:
+        lam_values = np.logspace(-3, 3, 11).tolist()
+
     splitter = EmbargoedTimeSeriesSplit(n_splits=n_splits, embargo_days=embargo_days)
-    fold_metrics = []
 
     logger.info(
         f"Starting {n_splits}-fold embargoed CV "
-        f"(embargo_days={embargo_days}, ~{embargo_days} obs stripped per fold)"
+        f"(embargo_days={embargo_days}, ~{embargo_days} obs stripped per fold, "
+        f"n_jobs={n_jobs})"
     )
 
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    # Pre-collect folds so we can dispatch them all at once
+    folds = [
+        (fold_num, train_idx, test_idx)
+        for fold_num, (train_idx, test_idx) in enumerate(splitter.split(X), start=1)
+    ]
 
-        logger.info(
-            f"  Fold {fold}: train={len(train_idx)} obs, "
-            f"test={len(test_idx)} obs (after embargo)"
+    if not folds:
+        raise RuntimeError(
+            "All CV folds were skipped — no test observations survived the embargo. "
+            "Reduce embargo_days in config or increase the dataset size."
         )
 
-        gam = fit_gam(X_train, y_train, terms, lam_values)
-        y_pred = gam.predict(X_test)
+    raw_results: list[dict] = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_fit_fold_worker)(fold_num, train_idx, test_idx, X, y, terms, lam_values)
+        for fold_num, train_idx, test_idx in folds
+    )
 
-        mae = np.mean(np.abs(y_test - y_pred))
-        rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
-        mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+    # Sort by fold number (parallel dispatch order is not guaranteed)
+    raw_results.sort(key=lambda r: r["fold"])
 
-        fold_metrics.append({
-            "fold": fold,
-            "train_size": len(train_idx),
-            "test_size": len(test_idx),
-            "mae": mae,
-            "rmse": rmse,
-            "mape": mape,
-        })
-        logger.info(
-            f"  Fold {fold}: MAE={mae:.2f}, RMSE={rmse:.2f}, MAPE={mape:.2f}%"
-        )
+    fold_metrics = []
+    for result in raw_results:
+        for line in result.pop("log_lines"):
+            logger.info(line)
+        fold_metrics.append(result)
 
     if not fold_metrics:
         raise RuntimeError(
@@ -345,6 +419,7 @@ def stepwise_aic_selection(
     config: dict,
     lam_values: list[float] | None = None,
     max_steps: int | None = None,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, list[int], list[str], list[str], LinearGAM]:
     """Iterative backward AIC elimination for GAM feature selection.
 
@@ -379,7 +454,7 @@ def stepwise_aic_selection(
 
     # ── Initial full model (grid-search) ─────────────────────────────────────
     terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
-    gam = fit_gam(X[:, current_indices], y, terms, lam_values)
+    gam = fit_gam(X[:, current_indices], y, terms, lam_values, n_jobs=n_jobs)
     current_aic = gam.statistics_["AIC"]
     current_lam = gam.lam  # reuse for fast trial fits
 
@@ -443,7 +518,7 @@ def stepwise_aic_selection(
     if dropped_names:
         logger.info("Refitting final model on selected features (full grid-search)…")
         final_terms = _build_gam_terms_for_indices(current_indices, feature_names, config)
-        gam = fit_gam(X[:, current_indices], y, final_terms, lam_values)
+        gam = fit_gam(X[:, current_indices], y, final_terms, lam_values, n_jobs=n_jobs)
         logger.info(f"Final AIC after grid-search: {gam.statistics_['AIC']:.4f}")
 
     return X[:, current_indices], current_indices, selected_names, dropped_names, gam
@@ -500,6 +575,7 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
     model_dir = root / "outputs" / "models"
     model_cfg = config.get("model", {})
     lam_values = model_cfg.get("lam_search")
+    n_jobs = model_cfg.get("n_jobs", 1)
 
     # Load features
     df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
@@ -515,6 +591,7 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
             X, y, feature_names, config,
             lam_values=lam_values,
             max_steps=model_cfg.get("stepwise_max_steps"),
+            n_jobs=n_jobs,
         )
         logger.info(f"Selected {len(feature_names)} features after stepwise selection.")
         if dropped:
@@ -531,11 +608,12 @@ def train_and_save(config: dict) -> tuple[LinearGAM, dict]:
         n_splits=model_cfg.get("cv_splits", 5),
         embargo_days=model_cfg.get("embargo_days", 200),
         lam_values=lam_values,
+        n_jobs=n_jobs,
     )
 
     # Fit final model on full dataset
     logger.info("Fitting final model on full dataset...")
-    gam = fit_gam(X, y, terms, lam_values)
+    gam = fit_gam(X, y, terms, lam_values, n_jobs=n_jobs)
 
     # Save model and feature names
     save_model(gam, model_dir / "gam_model.pkl")

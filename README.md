@@ -2,6 +2,8 @@
 
 End-to-end pipeline for forecasting WTI crude oil futures (CL=F) daily closing price using **Generalized Additive Models** (pyGAM). Pulls from four live data sources, engineers ~100 features, selects the most informative subset automatically, and exposes results through an interactive Streamlit dashboard with probabilistic forecasts.
 
+![Probabilistic forecast fan chart — GAM with Johnson SU prediction intervals](docs/figures/fan_chart.png)
+
 ## How it works
 
 The pipeline runs in five sequential stages:
@@ -45,6 +47,14 @@ The first ~200 rows are dropped as warm-up for the longest rolling windows. The 
 
 Generates four diagnostic plots in `outputs/figures/`: price history, seasonal decomposition (trend/seasonal/residual), ACF/PACF, and a pairwise correlation heatmap.
 
+![WTI and Brent crude oil price history](docs/figures/price_history.png)
+
+![Seasonal decomposition — trend, seasonal, and residual components](docs/figures/decomposition.png)
+
+| ACF / PACF | Feature correlation heatmap |
+|---|---|
+| ![ACF and PACF of WTI returns](docs/figures/acf_pacf.png) | ![Pairwise feature correlations](docs/figures/correlation.png) |
+
 ### Stage 4 — Model Training
 
 1. **Feature matrix construction** — raw OHLCV columns and non-target close prices are excluded; only engineered derivatives are used.
@@ -72,6 +82,20 @@ Generates four diagnostic plots in `outputs/figures/`: price history, seasonal d
 - **GAM term diagnostics** — smoothing λ and effective degrees of freedom (EDoF) per term
 
 All figures are saved to `outputs/figures/`.
+
+![GAM fit vs actual WTI close price](docs/figures/actual_vs_pred.png)
+
+![Probabilistic fan chart — 50/80/90/95% prediction bands](docs/figures/fan_chart.png)
+
+![Predictive density — Johnson SU PDF for the most recent observation](docs/figures/predictive_density.png)
+
+| Residual diagnostics | Residual ACF / PACF |
+|---|---|
+| ![Four-panel residual diagnostics](docs/figures/residuals.png) | ![ACF and PACF of model residuals](docs/figures/residual_acf_pacf.png) |
+
+| Ljung-Box white-noise test | GAM term diagnostics |
+|---|---|
+| ![Ljung-Box p-values across lags](docs/figures/ljung_box.png) | ![Smoothing λ and EDoF per GAM term](docs/figures/gam_term_diagnostics.png) |
 
 ### Dashboard
 

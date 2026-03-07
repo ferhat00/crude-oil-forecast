@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import holidays as holidays_lib
 import numpy as np
 import pandas as pd
 
@@ -209,6 +210,9 @@ def add_momentum_features(
     df: pd.DataFrame,
     target_col: str,
     rsi_period: int = 14,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
 ) -> pd.DataFrame:
     """Add momentum indicators: RSI and MACD.
 
@@ -219,6 +223,9 @@ def add_momentum_features(
         df: Input DataFrame.
         target_col: Price column.
         rsi_period: Lookback window for RSI.
+        macd_fast: Fast EMA span for MACD.
+        macd_slow: Slow EMA span for MACD.
+        macd_signal: Signal line EMA span for MACD.
 
     Returns:
         DataFrame with RSI, MACD line, signal line, and histogram added.
@@ -237,10 +244,10 @@ def add_momentum_features(
     df[f"{target_col}_rsi_{rsi_period}"] = 100 - (100 / (1 + rs))
 
     # ── MACD ─────────────────────────────────────────
-    ema_12 = series.ewm(span=12, min_periods=12, adjust=False).mean()
-    ema_26 = series.ewm(span=26, min_periods=26, adjust=False).mean()
-    macd_line = ema_12 - ema_26
-    signal_line = macd_line.ewm(span=9, min_periods=9, adjust=False).mean()
+    ema_fast = series.ewm(span=macd_fast, min_periods=macd_fast, adjust=False).mean()
+    ema_slow = series.ewm(span=macd_slow, min_periods=macd_slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=macd_signal, min_periods=macd_signal, adjust=False).mean()
 
     df[f"{target_col}_macd"] = macd_line
     df[f"{target_col}_macd_signal"] = signal_line
@@ -422,6 +429,261 @@ def add_price_level_features(
 
 
 # ─────────────────────────────────────────────
+# Additional Momentum & Volume Indicators
+# ─────────────────────────────────────────────
+
+def add_atr_features(
+    df: pd.DataFrame,
+    high_col: str,
+    low_col: str,
+    close_col: str,
+    period: int = 14,
+) -> pd.DataFrame:
+    """Add Average True Range (ATR) and normalised ATR.
+
+    ATR is a realised-volatility proxy that measures the average daily price
+    range over a rolling window, accounting for overnight gaps.
+
+    Args:
+        df: Input DataFrame containing OHLC columns.
+        high_col: Column name for daily highs.
+        low_col: Column name for daily lows.
+        close_col: Column name for close prices (also used as the name prefix).
+        period: EWM span for smoothing the True Range.
+
+    Returns:
+        DataFrame with ``{close_col}_atr_{period}`` and
+        ``{close_col}_atr_pct_{period}`` added.
+    """
+    high = df[high_col]
+    low = df[low_col]
+    close = df[close_col]
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(span=period, min_periods=period, adjust=False).mean()
+    df[f"{close_col}_atr_{period}"] = atr
+    df[f"{close_col}_atr_pct_{period}"] = atr / close
+
+    return df
+
+
+def add_williams_r(
+    df: pd.DataFrame,
+    high_col: str,
+    low_col: str,
+    close_col: str,
+    period: int = 14,
+) -> pd.DataFrame:
+    """Add Williams %R momentum oscillator.
+
+    %R measures where the close sits within the rolling high-low range.
+    Values near 0 indicate overbought; values near -100 indicate oversold.
+
+    Args:
+        df: Input DataFrame.
+        high_col: Daily high column.
+        low_col: Daily low column.
+        close_col: Close price column (also used as name prefix).
+        period: Rolling lookback window.
+
+    Returns:
+        DataFrame with ``{close_col}_williams_r_{period}`` added.
+    """
+    rolling_high = df[high_col].rolling(period, min_periods=period).max()
+    rolling_low = df[low_col].rolling(period, min_periods=period).min()
+    df[f"{close_col}_williams_r_{period}"] = (
+        (rolling_high - df[close_col]) / (rolling_high - rolling_low) * -100
+    )
+    return df
+
+
+def add_stochastic(
+    df: pd.DataFrame,
+    high_col: str,
+    low_col: str,
+    close_col: str,
+    k_period: int = 14,
+    d_period: int = 3,
+) -> pd.DataFrame:
+    """Add Stochastic %K and %D oscillators.
+
+    %K = position of close within the k_period rolling range (0–100).
+    %D = simple moving average of %K over d_period days (signal line).
+
+    Args:
+        df: Input DataFrame.
+        high_col: Daily high column.
+        low_col: Daily low column.
+        close_col: Close price column (also used as name prefix).
+        k_period: Lookback window for %K.
+        d_period: Smoothing window for %D.
+
+    Returns:
+        DataFrame with ``{close_col}_stoch_k_{k_period}`` and
+        ``{close_col}_stoch_d_{k_period}`` added.
+    """
+    rolling_high = df[high_col].rolling(k_period, min_periods=k_period).max()
+    rolling_low = df[low_col].rolling(k_period, min_periods=k_period).min()
+    stoch_k = (df[close_col] - rolling_low) / (rolling_high - rolling_low) * 100
+    df[f"{close_col}_stoch_k_{k_period}"] = stoch_k
+    df[f"{close_col}_stoch_d_{k_period}"] = stoch_k.rolling(d_period, min_periods=d_period).mean()
+    return df
+
+
+def add_cmf(
+    df: pd.DataFrame,
+    high_col: str,
+    low_col: str,
+    close_col: str,
+    volume_col: str,
+    period: int = 20,
+) -> pd.DataFrame:
+    """Add Chaikin Money Flow (CMF).
+
+    CMF measures volume-weighted buying vs. selling pressure over a rolling
+    window. Positive values indicate accumulation; negative values indicate
+    distribution. Useful as a leading indicator of crude demand shifts.
+
+    Args:
+        df: Input DataFrame.
+        high_col: Daily high column.
+        low_col: Daily low column.
+        close_col: Close price column (also used as name prefix).
+        volume_col: Volume column.
+        period: Rolling window for CMF calculation.
+
+    Returns:
+        DataFrame with ``{close_col}_cmf_{period}`` added.
+    """
+    high = df[high_col]
+    low = df[low_col]
+    close = df[close_col]
+    volume = df[volume_col]
+
+    hl_range = (high - low).replace(0, np.nan)
+    mfm = ((close - low) - (high - close)) / hl_range
+    mfv = mfm * volume
+
+    df[f"{close_col}_cmf_{period}"] = (
+        mfv.rolling(period, min_periods=period).sum()
+        / volume.rolling(period, min_periods=period).sum()
+    )
+    return df
+
+
+def add_rolling_correlations(
+    df: pd.DataFrame,
+    target_col: str,
+    pair_names: list[str],
+    windows: list[int],
+) -> pd.DataFrame:
+    """Add rolling correlations of the target with cross-asset price series.
+
+    Rolling correlations capture regime-dependent relationships (e.g., the
+    WTI–DXY correlation flips sign across risk-on/risk-off regimes).
+
+    Args:
+        df: Input DataFrame. Each pair must have a ``{pair}_close`` column.
+        target_col: Target price column (WTI close).
+        pair_names: List of descriptive names; looks up ``{name}_close`` in df.
+        windows: Rolling window sizes (days).
+
+    Returns:
+        DataFrame with ``corr_{pair}_{window}`` columns added.
+    """
+    target = df[target_col]
+    for pair in pair_names:
+        pair_col = f"{pair}_close"
+        if pair_col not in df.columns:
+            logger.warning(f"Rolling correlation skipped: '{pair_col}' not in columns")
+            continue
+        for window in windows:
+            df[f"corr_{pair}_{window}"] = target.rolling(window, min_periods=window).corr(df[pair_col])
+    return df
+
+
+def add_momentum_windows(
+    df: pd.DataFrame,
+    target_col: str,
+    windows: list[int],
+) -> pd.DataFrame:
+    """Add time-series momentum features (multi-period returns).
+
+    Captures medium-to-long-term price trends: 1-month, 1-quarter, and
+    6-month simple returns.  Momentum strategies in commodities have
+    historically earned positive risk premia.
+
+    Args:
+        df: Input DataFrame.
+        target_col: Price column.
+        windows: List of lookback periods (e.g., [21, 63, 126]).
+
+    Returns:
+        DataFrame with ``{target_col}_momentum_{window}`` columns added.
+    """
+    price = df[target_col]
+    for window in windows:
+        df[f"{target_col}_momentum_{window}"] = (price - price.shift(window)) / price.shift(window)
+    return df
+
+
+def add_seasonal_flags(
+    df: pd.DataFrame,
+    seasonal_cfg: dict,
+) -> pd.DataFrame:
+    """Add binary seasonality flags.
+
+    Three demand-seasonality signals:
+    - driving_season: 1 between US Memorial Day and Labor Day (gasoline peak)
+    - heating_season: 1 during Oct–Mar (distillate/heating oil demand peak)
+    - us_holiday: 1 on US federal holidays (thin-liquidity, exaggerated moves)
+
+    Args:
+        df: Input DataFrame with DatetimeIndex.
+        seasonal_cfg: Dict with boolean keys ``driving_season``,
+            ``heating_season``, and ``us_holidays``.
+
+    Returns:
+        DataFrame with flag columns added for each enabled flag.
+    """
+    idx = df.index
+
+    if seasonal_cfg.get("driving_season"):
+        driving = pd.Series(0, index=idx)
+        for year in idx.year.unique():
+            # Memorial Day = last Monday of May
+            memorial_day = pd.Timestamp(year=year, month=5, day=31) + pd.offsets.Week(weekday=0, n=0) - pd.offsets.Week(weekday=0, n=0)
+            # Walk back to find last Monday of May
+            md = pd.Timestamp(year=year, month=5, day=31)
+            while md.dayofweek != 0:
+                md -= pd.Timedelta(days=1)
+            # Labor Day = first Monday of September
+            ld = pd.Timestamp(year=year, month=9, day=1)
+            while ld.dayofweek != 0:
+                ld += pd.Timedelta(days=1)
+            driving.loc[(idx >= md) & (idx <= ld)] = 1
+        df["driving_season"] = driving.values
+
+    if seasonal_cfg.get("heating_season"):
+        df["heating_season"] = idx.month.isin([10, 11, 12, 1, 2, 3]).astype(int)
+
+    if seasonal_cfg.get("us_holidays"):
+        years = range(idx.year.min(), idx.year.max() + 1)
+        us_holiday_dates = set(holidays_lib.country_holidays("US", years=years).keys())
+        df["us_holiday"] = idx.normalize().map(
+            lambda d: 1 if d.date() in us_holiday_dates else 0
+        )
+
+    return df
+
+
+# ─────────────────────────────────────────────
 # Pipeline Orchestrator
 # ─────────────────────────────────────────────
 
@@ -436,7 +698,10 @@ def build_features(config: dict) -> pd.DataFrame:
     - Exogenous lags of macro variables (7d, 14d)
     - Rolling SMA, EMA, and volatility (14, 50, 200 day windows)
     - Bollinger Bands and %B (20-day)
-    - Momentum indicators: RSI(14) and MACD(12,26,9)
+    - Momentum indicators: RSI, MACD (configurable), ATR, Williams %R, Stochastic, CMF
+    - Rolling cross-asset correlations (WTI vs DXY, gold, S&P, copper, nat gas)
+    - Time-series momentum (1M, 1Q, 6M returns)
+    - Seasonality flags (driving season, heating season, US holidays)
     - Calendar features with cyclic encoding (month, day_of_week, day_of_year)
     - Daily returns and log-returns
     - Brent–WTI spread and ratio
@@ -455,6 +720,20 @@ def build_features(config: dict) -> pd.DataFrame:
 
     feat_cfg = config["features"]
     target = feat_cfg["target"]
+
+    # ── Feature config params ──────────────────────────────────────────────
+    macd_fast = feat_cfg.get("macd_fast", 12)
+    macd_slow = feat_cfg.get("macd_slow", 26)
+    macd_signal = feat_cfg.get("macd_signal", 9)
+    atr_period = feat_cfg.get("atr_period", 14)
+    williams_r_period = feat_cfg.get("williams_r_period", 14)
+    stoch_k = feat_cfg.get("stochastic_k_period", 14)
+    stoch_d = feat_cfg.get("stochastic_d_period", 3)
+    cmf_period = feat_cfg.get("cmf_period", 20)
+    corr_windows = feat_cfg.get("correlation_windows", [30, 90])
+    corr_pairs = feat_cfg.get("correlation_pairs", [])
+    mom_windows = feat_cfg.get("momentum_windows", [21, 63, 126])
+    seasonal_cfg = feat_cfg.get("seasonal_flags", {})
 
     # ── Load raw data ─────────────────────────────────
     oil_df = pd.read_parquet(raw_dir / "oil_prices.parquet")
@@ -527,6 +806,14 @@ def build_features(config: dict) -> pd.DataFrame:
             "usd_index", "cpi", "fed_funds", "t10y2y",
             "t3m_yield_close", "t5y_yield_close",
             "t10y_yield_close", "t30y_yield_close",
+            # Financial conditions & systemic risk
+            "nfci", "stlfsi", "epu_us", "epu_global",
+            # Real economy / demand
+            "pmi_mfg", "retail_gas", "miles_driven",
+            # Fed balance sheet / liquidity
+            "fed_balance", "rrp",
+            # Credit / risk appetite
+            "ig_spread", "ted_spread",
         ]
         if c in df.columns
     ]
@@ -572,8 +859,37 @@ def build_features(config: dict) -> pd.DataFrame:
     # 5. Bollinger Bands (20-day, 2 std)
     df = add_bollinger_bands(df, target_col, window=20, n_std=2.0)
 
-    # 6. Momentum: RSI(14), MACD(12,26,9)
-    df = add_momentum_features(df, target_col, rsi_period=14)
+    # 6. Momentum: RSI, MACD (configurable params)
+    df = add_momentum_features(
+        df, target_col,
+        rsi_period=feat_cfg.get("rsi_period", 14),
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal=macd_signal,
+    )
+
+    # 6b. ATR, Williams %R, Stochastic, CMF (use WTI OHLCV)
+    wti_high = "CL=F_high" if "CL=F_high" in df.columns else None
+    wti_low = "CL=F_low" if "CL=F_low" in df.columns else None
+    wti_vol = "CL=F_volume" if "CL=F_volume" in df.columns else None
+    if wti_col and wti_high and wti_low:
+        df = add_atr_features(df, wti_high, wti_low, wti_col, atr_period)
+        df = add_williams_r(df, wti_high, wti_low, wti_col, williams_r_period)
+        df = add_stochastic(df, wti_high, wti_low, wti_col, stoch_k, stoch_d)
+        if wti_vol:
+            df = add_cmf(df, wti_high, wti_low, wti_col, wti_vol, cmf_period)
+
+    # 6c. Rolling cross-asset correlations
+    if corr_pairs:
+        df = add_rolling_correlations(df, target_col, corr_pairs, corr_windows)
+
+    # 6d. Time-series momentum (multi-period returns)
+    if mom_windows:
+        df = add_momentum_windows(df, target_col, mom_windows)
+
+    # 6e. Seasonality flags
+    if seasonal_cfg:
+        df = add_seasonal_flags(df, seasonal_cfg)
 
     # 7. Price level features (needs MAs to be computed first)
     df = add_price_level_features(df, target_col)

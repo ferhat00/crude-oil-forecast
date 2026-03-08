@@ -668,7 +668,7 @@ def add_seasonal_flags(
             while ld.dayofweek != 0:
                 ld += pd.Timedelta(days=1)
             driving.loc[(idx >= md) & (idx <= ld)] = 1
-        df["driving_season"] = driving.values
+        df["driving_season"] = driving.astype(int)
 
     if seasonal_cfg.get("heating_season"):
         df["heating_season"] = idx.month.isin([10, 11, 12, 1, 2, 3]).astype(int)

@@ -224,7 +224,9 @@ def plot_predictive_density_plotly(
         margin = (x_hi - x_lo) * 0.1
         x = np.linspace(x_lo - margin, x_hi + margin, 800)
         pdf = dist.pdf(x, mu, sigma)
-        pdf_label = f"Johnson SU PDF (ν={dist.nu:.2f}, τ={dist.tau:.2f})"
+        nu_val = float(np.mean(dist.nu)) if isinstance(dist.nu, np.ndarray) else float(dist.nu)
+        tau_val = float(np.mean(dist.tau)) if isinstance(dist.tau, np.ndarray) else float(dist.tau)
+        pdf_label = f"Johnson SU PDF (ν={nu_val:.2f}, τ={tau_val:.2f})"
     else:
         x = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 800)
         pdf = stats.norm.pdf(x, loc=mu, scale=sigma)

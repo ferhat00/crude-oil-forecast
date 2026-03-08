@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:pygam.readthedocs.io)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(pip install *)",
+      "Bash(python -c *)",
+      "Bash(python3 -c *)"
+    ]
+  }
+}

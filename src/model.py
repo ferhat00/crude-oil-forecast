@@ -22,11 +22,24 @@ MACRO_PATTERNS = (
     "t3m_yield", "t5y_yield", "t10y_yield", "t30y_yield",
     "eur_usd", "gbp_usd", "usd_cad", "usd_nok",
     "usd_rub", "usd_cny", "aud_usd", "nzd_usd", "usd_chf",
+    # Financial conditions & systemic risk
+    "nfci", "stlfsi", "epu_us", "epu_global",
+    # Real economy / demand
+    "pmi_mfg", "retail_gas", "miles_driven",
+    # Fed balance sheet / liquidity
+    "fed_balance", "rrp",
+    # Credit / risk appetite
+    "ig_spread", "ted_spread",
+    # Binary seasonality flags (0/1 → linear term is appropriate)
+    "driving_season", "heating_season", "us_holiday",
 )
 # Cyclic spline (s, basis='cp'): calendar features that wrap around
 CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
 # Spline with more knots: rolling/momentum indicators
-ROLLING_PATTERNS = ("_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_", "crack_")
+ROLLING_PATTERNS = (
+    "_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_", "crack_",
+    "_atr_", "_williams_r_", "_stoch_", "_cmf_", "corr_", "_momentum_",
+)
 # Spline: autoregressive and exogenous lags
 LAG_PATTERNS = ("_lag_",)
 # Spline: returns and log-returns
@@ -37,10 +50,11 @@ SPREAD_PATTERNS = ("_spread", "_ratio", "_dist_sma", "_pct_range", "_52w")
 # Volatility / risk patterns → candidate features for the sigma (scale) sub-model
 SIGMA_FEATURE_PATTERNS = (
     "ovx", "vix", "_std_", "_bb_width", "hy_spread", "_log_return", "t5yie", "t10yie",
+    "_atr_", "_atr_pct", "_stoch_", "_williams_r_", "nfci", "stlfsi",
 )
 
 # Risk / regime patterns → candidate features for the nu (skewness) and tau (tail) sub-models
-NU_TAU_FEATURE_PATTERNS = ("ovx", "vix", "hy_spread", "t5yie", "t10yie")
+NU_TAU_FEATURE_PATTERNS = ("ovx", "vix", "hy_spread", "t5yie", "t10yie", "nfci", "stlfsi", "epu_us")
 
 
 def compute_bic(gam: LinearGAM, n_samples: int) -> float:

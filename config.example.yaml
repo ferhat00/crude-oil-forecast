@@ -16,6 +16,21 @@ data:
     cpi: "CPIAUCSL"             # Consumer Price Index
     fed_funds: "DFF"            # Federal Funds Effective Rate
     t10y2y: "T10Y2Y"            # 10-Year minus 2-Year Treasury spread
+    # ── Financial conditions & systemic risk ──────────────────────────────
+    nfci:         "NFCI"              # Chicago Fed National Financial Conditions Index (weekly)
+    stlfsi:       "STLFSI4"           # St. Louis Fed Financial Stress Index (weekly)
+    epu_us:       "USEPUINDXD"        # US Economic Policy Uncertainty Index (daily)
+    epu_global:   "GEPUPPP"           # Global Economic Policy Uncertainty (monthly)
+    # ── Real economy / demand ─────────────────────────────────────────────
+    pmi_mfg:      "NAPM"              # ISM Manufacturing PMI (monthly)
+    retail_gas:   "GASREGCOVW"        # US Regular Gasoline Retail Price (weekly, EIA via FRED)
+    miles_driven: "M12MTVUSM227NFWA"  # Vehicle Miles Travelled (monthly)
+    # ── Fed balance sheet / liquidity ─────────────────────────────────────
+    fed_balance:  "WALCL"             # Fed total assets — QE/QT liquidity proxy (weekly)
+    rrp:          "RRPONTSYD"         # Overnight reverse repo — excess liquidity gauge (daily)
+    # ── Credit / risk appetite ────────────────────────────────────────────
+    ig_spread:    "BAMLC0A0CM"        # ICE BofA US Investment Grade OAS (daily)
+    ted_spread:   "TEDRATE"           # TED spread — interbank stress proxy (daily)
   eia_series:
     crude_stocks:      "PET.WTTSTUS1.W"   # Weekly U.S. Ending Stocks of Crude Oil
     production:        "PET.WCRFPUS2.W"   # Weekly U.S. Crude Oil Production
@@ -23,13 +38,21 @@ data:
     distillate_stocks: "PET.WDISTUS1.W"   # Weekly U.S. Distillate Fuel Stocks
     crude_imports:     "PET.WCRRIUS2.W"   # Weekly U.S. Crude Oil Imports
     spr:               "PET.WCRSTUS1.W"   # Weekly U.S. Strategic Petroleum Reserve
+    # ── Natural gas storage (inter-fuel competition signal) ──────────────────
+    # Note: US oil rig count (Baker Hughes) is not available via EIA API v2
+    nat_gas_stocks:    "NG.NW2_EPG0_SWO_R48_BCF.W"  # Natural gas storage lower-48 (BCF, weekly)
 
 alpha_vantage:
   api_key: "YOUR_ALPHA_VANTAGE_API_KEY"  # https://www.alphavantage.co/support/#api-key
   base_url: "https://www.alphavantage.co/query"
   series:
     av_consumer_sentiment: "CONSUMER_SENTIMENT"  # University of Michigan Consumer Sentiment
-    av_nonfarm_payroll: "NONFARM_PAYROLL"         # US Nonfarm Payrolls (demand proxy)
+    av_nonfarm_payroll:   "NONFARM_PAYROLL"       # US Nonfarm Payrolls (demand proxy)
+    av_real_gdp:          "REAL_GDP"              # Quarterly real GDP growth (demand baseline)
+    av_wti_spot:          "WTI"                   # WTI crude spot price from AV (cross-check)
+    av_natural_gas:       "NATURAL_GAS"           # Henry Hub spot (monthly, cross-check)
+    av_copper:            "COPPER"                # LME copper price — industrial demand composite
+    av_global_cpi:        "CPI"                   # US CPI (monthly AV version)
 
 cot:
   enabled: true  # CFTC Commitments of Traders — WTI speculative positioning (no API key)
@@ -73,6 +96,18 @@ market_tickers:
   t5y_yield:    "^FVX"        # 5-Year Treasury Note yield
   t10y_yield:   "^TNX"        # 10-Year Treasury Note yield (global benchmark)
   t30y_yield:   "^TYX"        # 30-Year Treasury Bond yield
+  # ── Commodity complex (supply-side cost curves) ──────────────────────────
+  lumber:       "LBS=F"       # Lumber — construction activity proxy
+  wheat:        "ZW=F"        # Wheat — agri commodities move with energy costs
+  corn:         "ZC=F"        # Corn — ethanol blend demand proxy
+  # ── Shipping / freight ───────────────────────────────────────────────────
+  bdry:         "BDRY"        # Breakwave Dry Bulk Shipping ETF (BDI proxy)
+  # ── Energy transition pressure ────────────────────────────────────────────
+  icln:         "ICLN"        # iShares Global Clean Energy ETF
+  lithium:      "LIT"         # Lithium ETF — EV adoption proxy
+  tan:          "TAN"         # Invesco Solar ETF
+  # ── Equity volatility term structure ──────────────────────────────────────
+  vix3m:        "^VIX3M"      # 3-Month VIX — term structure vs spot VIX
 
 features:
   lag_days: [1, 3, 7, 30]           # Autoregressive lags of the target
@@ -81,6 +116,36 @@ features:
   bollinger_window: 20              # Bollinger Band window
   rsi_period: 14                    # RSI lookback period
   target: "CL=F_close"
+
+  # ── MACD parameters (previously hardcoded 12/26/9) ──────────────────────
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+  # ── Additional momentum indicators ───────────────────────────────────────
+  atr_period: 14                   # Average True Range — realised volatility proxy
+  williams_r_period: 14            # Williams %R — overbought/oversold momentum
+  stochastic_k_period: 14          # Stochastic %K
+  stochastic_d_period: 3           # Stochastic %D (smoothed signal line)
+  cmf_period: 20                   # Chaikin Money Flow — volume-weighted buying pressure
+
+  # ── Rolling cross-asset correlations ────────────────────────────────────
+  correlation_windows: [30, 90]    # Rolling corr of WTI vs each pair below
+  correlation_pairs:               # Must match keys in market_tickers
+    - "usd_index_yf"
+    - "gold"
+    - "sp500"
+    - "copper"
+    - "nat_gas"
+
+  # ── Longer momentum windows (quarter/half-year) ──────────────────────────
+  momentum_windows: [21, 63, 126]  # 1-month, 1-quarter, 6-month returns
+
+  # ── Seasonality flags ────────────────────────────────────────────────────
+  seasonal_flags:
+    driving_season: true           # 1 between Memorial Day and Labor Day
+    heating_season: true           # 1 Oct–Mar
+    us_holidays: true              # 1 on US federal holidays
 
 model:
   n_splines: 25

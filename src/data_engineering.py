@@ -497,8 +497,10 @@ def add_williams_r(
     """
     rolling_high = df[high_col].rolling(period, min_periods=period).max()
     rolling_low = df[low_col].rolling(period, min_periods=period).min()
+    denom = rolling_high - rolling_low
+    denom = denom.where(denom != 0, np.nan)
     df[f"{close_col}_williams_r_{period}"] = (
-        (rolling_high - df[close_col]) / (rolling_high - rolling_low) * -100
+        (rolling_high - df[close_col]) / denom * -100
     )
     return df
 

@@ -210,3 +210,6 @@ __marimo__/
 config.yaml
 data/
 outputs/
+
+# Claude local settings (machine-specific, use .claude/settings.local.json.example as template)
+.claude/settings.local.json

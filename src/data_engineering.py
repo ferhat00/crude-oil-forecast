@@ -532,7 +532,8 @@ def add_stochastic(
     """
     rolling_high = df[high_col].rolling(k_period, min_periods=k_period).max()
     rolling_low = df[low_col].rolling(k_period, min_periods=k_period).min()
-    stoch_k = (df[close_col] - rolling_low) / (rolling_high - rolling_low) * 100
+    rolling_range = (rolling_high - rolling_low).replace(0, np.nan)
+    stoch_k = (df[close_col] - rolling_low) / rolling_range * 100
     df[f"{close_col}_stoch_k_{k_period}"] = stoch_k
     df[f"{close_col}_stoch_d_{k_period}"] = stoch_k.rolling(d_period, min_periods=d_period).mean()
     return df

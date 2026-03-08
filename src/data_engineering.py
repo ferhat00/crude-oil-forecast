@@ -661,7 +661,6 @@ def add_seasonal_flags(
         driving = pd.Series(0, index=idx)
         for year in idx.year.unique():
             # Memorial Day = last Monday of May
-            memorial_day = pd.Timestamp(year=year, month=5, day=31) + pd.offsets.Week(weekday=0, n=0) - pd.offsets.Week(weekday=0, n=0)
             # Walk back to find last Monday of May
             md = pd.Timestamp(year=year, month=5, day=31)
             while md.dayofweek != 0:

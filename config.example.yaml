@@ -148,18 +148,36 @@ features:
     us_holidays: true              # 1 on US federal holidays
 
 model:
+  active_mode: fast                    # "fast" or "thorough"
+
+  # ── Fast preset: fewer lambdas, no hard cap, fewer steps/folds ───────────
+  fast:
+    stepwise_selection: true
+    stepwise_criterion: aic
+    stepwise_max_steps: 15
+    target_max_terms: null             # No hard-cap stage
+    lam_search: [0.01, 1, 100]
+    cv_splits: 3
+    sigma_stepwise: true
+    sigma_max_terms: null
+    nu_max_terms: null
+    tau_max_terms: null
+
+  # ── Thorough preset: full grid, hard cap, more steps/folds ───────────────
+  thorough:
+    stepwise_selection: true
+    stepwise_criterion: bic
+    stepwise_max_steps: 50
+    target_max_terms: 25               # Hard cap on mu model terms
+    lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
+    cv_splits: 5
+    sigma_stepwise: true
+    sigma_max_terms: 12
+    nu_max_terms: 8
+    tau_max_terms: 8
+
+  # ── Shared settings (apply to both presets, overridable per preset) ──────
   n_splines: 25
-  lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
-  cv_splits: 5
-  embargo_days: 200         # Obs to drop between train/test boundary (= max rolling window)
-  stepwise_selection: true  # Backward elimination to drop irrelevant/redundant features
-  stepwise_criterion: "bic" # "bic" (default, more aggressive) or "aic"
-  stepwise_max_steps: 50    # Max elimination iterations (null = unlimited)
-  target_max_terms: 25      # Hard cap on mu model terms after BIC stepwise (null = no cap)
-  n_jobs: -1                # Parallel workers: -1 = all logical CPUs, 1 = sequential
-  # ── Distributional sub-models (sigma, nu, tau) ─────────────────────────────
-  sigma_stepwise: true      # Apply BIC stepwise to sigma sub-model
-  sigma_max_terms: 12       # Hard cap on sigma model terms
-  nu_tau_window: 60         # Rolling window (days) for skewness/kurtosis estimation
-  nu_max_terms: 8           # Hard cap on nu (skewness) model terms
-  tau_max_terms: 8          # Hard cap on tau (tail-weight) model terms
+  embargo_days: 200                    # Obs to drop between train/test boundary
+  n_jobs: -1                           # Parallel workers: -1 = all CPUs
+  nu_tau_window: 60                    # Rolling window for skewness/kurtosis

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.config_loader import resolve_model_config
 from src.model import (
     _classify_feature,
     build_feature_matrix,
@@ -239,3 +240,118 @@ class TestNuTauModels:
         )
         preds = nu_gam.predict(X_valid[:, sel_idx])
         assert len(preds) == X_valid.shape[0]
+
+
+class TestResolveModelConfig:
+    """Tests for the preset-based model config resolution."""
+
+    def test_legacy_flat_config(self):
+        """Old-style config without active_mode returns as-is."""
+        config = {
+            "model": {
+                "n_splines": 20,
+                "cv_splits": 3,
+                "lam_search": [0.1, 1],
+            }
+        }
+        resolved = resolve_model_config(config)
+        assert resolved["n_splines"] == 20
+        assert resolved["cv_splits"] == 3
+        assert "_active_mode" not in resolved
+
+    def test_fast_mode(self):
+        """Fast preset resolves its values correctly."""
+        config = {
+            "model": {
+                "active_mode": "fast",
+                "fast": {
+                    "stepwise_criterion": "aic",
+                    "stepwise_max_steps": 15,
+                    "target_max_terms": None,
+                    "lam_search": [0.01, 1, 100],
+                    "cv_splits": 3,
+                },
+                "thorough": {
+                    "stepwise_criterion": "bic",
+                    "cv_splits": 5,
+                },
+                "n_splines": 25,
+            }
+        }
+        resolved = resolve_model_config(config)
+        assert resolved["_active_mode"] == "fast"
+        assert resolved["stepwise_criterion"] == "aic"
+        assert resolved["stepwise_max_steps"] == 15
+        assert resolved["target_max_terms"] is None
+        assert resolved["lam_search"] == [0.01, 1, 100]
+        assert resolved["cv_splits"] == 3
+        assert resolved["n_splines"] == 25
+
+    def test_thorough_mode(self):
+        """Thorough preset resolves its values correctly."""
+        config = {
+            "model": {
+                "active_mode": "thorough",
+                "fast": {"cv_splits": 3},
+                "thorough": {
+                    "stepwise_criterion": "bic",
+                    "stepwise_max_steps": 50,
+                    "target_max_terms": 25,
+                    "cv_splits": 5,
+                },
+            }
+        }
+        resolved = resolve_model_config(config)
+        assert resolved["_active_mode"] == "thorough"
+        assert resolved["stepwise_criterion"] == "bic"
+        assert resolved["cv_splits"] == 5
+        assert resolved["target_max_terms"] == 25
+
+    def test_shared_keys_applied(self):
+        """Shared keys outside preset blocks are picked up."""
+        config = {
+            "model": {
+                "active_mode": "fast",
+                "fast": {"cv_splits": 3},
+                "thorough": {},
+                "n_splines": 30,
+                "embargo_days": 150,
+            }
+        }
+        resolved = resolve_model_config(config)
+        assert resolved["n_splines"] == 30
+        assert resolved["embargo_days"] == 150
+
+    def test_preset_overrides_shared(self):
+        """Preset block values win over shared keys."""
+        config = {
+            "model": {
+                "active_mode": "fast",
+                "fast": {"n_splines": 15},
+                "thorough": {},
+                "n_splines": 30,
+            }
+        }
+        resolved = resolve_model_config(config)
+        assert resolved["n_splines"] == 15
+
+    def test_invalid_mode_raises(self):
+        """Unknown active_mode raises ValueError."""
+        config = {"model": {"active_mode": "turbo"}}
+        with pytest.raises(ValueError, match="Unknown model.active_mode"):
+            resolve_model_config(config)
+
+    def test_defaults_fill_missing_keys(self):
+        """Hard-coded defaults fill in any keys absent from both shared and preset."""
+        config = {
+            "model": {
+                "active_mode": "fast",
+                "fast": {},
+                "thorough": {},
+            }
+        }
+        resolved = resolve_model_config(config)
+        # Should fall back to _MODEL_DEFAULTS
+        assert resolved["n_splines"] == 25
+        assert resolved["embargo_days"] == 200
+        assert resolved["sigma_max_terms"] == 12

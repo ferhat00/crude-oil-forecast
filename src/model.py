@@ -11,7 +11,7 @@ import pandas as pd
 from pygam import LinearGAM, l, s
 from sklearn.model_selection import TimeSeriesSplit
 
-from src.config_loader import get_project_root
+from src.config_loader import get_project_root, resolve_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -734,7 +734,7 @@ def fit_sigma_gam(
         Tuple of (sigma_gam, selected_names, selected_local_indices) where
         *selected_local_indices* are positions into *X_sigma*.
     """
-    model_cfg = config.get("model", {})
+    model_cfg = resolve_model_config(config)
     sigma_max = model_cfg.get("sigma_max_terms")
     do_stepwise = model_cfg.get("sigma_stepwise", True)
     log_abs_resid = np.log(np.abs(mu_residuals) + 1e-6)
@@ -808,7 +808,7 @@ def fit_distributional_gam(
         Tuple of (gam, selected_names, selected_local_indices) where
         *selected_local_indices* are positions into *X_nu_tau*.
     """
-    model_cfg = config.get("model", {})
+    model_cfg = resolve_model_config(config)
     do_stepwise = model_cfg.get("sigma_stepwise", True)  # reuse sigma_stepwise flag
 
     if do_stepwise and len(feature_names) > 1:
@@ -908,7 +908,7 @@ def train_and_save(config: dict) -> tuple:
     """
     root = get_project_root(config)
     model_dir = root / "outputs" / "models"
-    model_cfg = config.get("model", {})
+    model_cfg = resolve_model_config(config)
     lam_values = model_cfg.get("lam_search")
     n_jobs = model_cfg.get("n_jobs", 1)
 

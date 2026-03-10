@@ -1,10 +1,75 @@
 """Configuration loader for the crude oil forecasting pipeline."""
 
+import logging
 import os
 from pathlib import Path
 
 import yaml
 from fredapi import Fred
+
+logger = logging.getLogger(__name__)
+
+# Hard-coded defaults matching the previous flat config behaviour.
+_MODEL_DEFAULTS: dict = {
+    "n_splines": 25,
+    "lam_search": [0.001, 0.01, 0.1, 1, 10, 100],
+    "cv_splits": 5,
+    "embargo_days": 200,
+    "stepwise_selection": True,
+    "stepwise_criterion": "bic",
+    "stepwise_max_steps": 50,
+    "target_max_terms": 25,
+    "n_jobs": -1,
+    "sigma_stepwise": True,
+    "sigma_max_terms": 12,
+    "nu_tau_window": 60,
+    "nu_max_terms": 8,
+    "tau_max_terms": 8,
+}
+
+_PRESET_KEYS = {"active_mode", "fast", "thorough"}
+
+
+def resolve_model_config(config: dict) -> dict:
+    """Resolve the ``model`` section into a flat dict, applying preset defaults.
+
+    Supports two config styles:
+
+    **Legacy (flat)** — no ``active_mode`` key; the ``model`` dict is returned
+    as-is, which preserves full backward compatibility.
+
+    **Preset-based** — ``active_mode`` selects a named preset block (``fast``
+    or ``thorough``).  Resolution order (later wins):
+
+        hard-coded defaults  <  shared keys  <  active preset block
+
+    Returns:
+        Flat dict usable via ``model_cfg.get(key, default)``.
+    """
+    model_section = config.get("model", {})
+    active_mode = model_section.get("active_mode")
+
+    # Legacy flat config — return as-is.
+    if active_mode is None:
+        return model_section
+
+    if active_mode not in ("fast", "thorough"):
+        raise ValueError(
+            f"Unknown model.active_mode '{active_mode}'. "
+            "Expected 'fast' or 'thorough'."
+        )
+
+    preset_block = model_section.get(active_mode, {})
+
+    # Shared keys = everything in model_section except reserved preset keys.
+    shared = {k: v for k, v in model_section.items() if k not in _PRESET_KEYS}
+
+    # Merge: defaults < shared < preset
+    resolved = {**_MODEL_DEFAULTS, **shared, **preset_block}
+    resolved["_active_mode"] = active_mode
+
+    logger.info("Model selection mode: %s", active_mode)
+    return resolved
 
 
 def _find_project_root() -> Path:

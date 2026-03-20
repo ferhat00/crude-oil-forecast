@@ -80,18 +80,28 @@ def compute_bic(gam: LinearGAM, n_samples: int) -> float:
 def build_feature_matrix(
     df: pd.DataFrame,
     target_col: str,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Separate target from features.
+    forecast_horizon: int = 1,
+) -> tuple[np.ndarray, np.ndarray, list[str], pd.DatetimeIndex]:
+    """Separate target from features with an optional forward target shift.
+
+    When ``forecast_horizon >= 1`` the target is shifted forward so that
+    features from day *i* predict the closing price ``forecast_horizon``
+    trading days ahead.  The last ``forecast_horizon`` rows are dropped
+    (their target is unknown).
 
     Excludes raw price/volume columns that would leak future information,
     keeping only engineered features and exogenous variables.
 
     Args:
-        df: Feature-engineered DataFrame.
+        df: Feature-engineered DataFrame with DatetimeIndex.
         target_col: Name of the target column.
+        forecast_horizon: Number of trading days ahead to forecast.
+            0 keeps same-day alignment (useful for extracting the latest
+            feature row for live prediction).
 
     Returns:
-        Tuple of (X, y, feature_names).
+        Tuple of (X, y, feature_names, target_dates) where *target_dates*
+        is the DatetimeIndex of the dates being predicted.
     """
     # Columns to exclude: target itself and raw price/volume OHLCV columns
     # (we keep their engineered derivatives like lags, rolling, returns)
@@ -111,12 +121,26 @@ def build_feature_matrix(
     feature_names = feature_cols
 
     X = df[feature_cols].values.astype(np.float64)
-    y = df[target_col].values.astype(np.float64)
 
-    logger.info(f"Feature matrix: {X.shape[0]} samples, {X.shape[1]} features")
+    if forecast_horizon >= 1:
+        # Shift target forward: features from day i predict day i+horizon
+        n = len(df)
+        y_all = df[target_col].values.astype(np.float64)
+        # Number of usable rows (last `horizon` rows have no target)
+        n_valid = n - forecast_horizon
+        X = X[:n_valid]
+        y = y_all[forecast_horizon:]  # target is the price `horizon` days later
+        # target_dates[i] = the actual trading date whose close we predict
+        target_dates = df.index[forecast_horizon:]
+    else:
+        y = df[target_col].values.astype(np.float64)
+        target_dates = df.index
+
+    logger.info(f"Feature matrix: {X.shape[0]} samples, {X.shape[1]} features "
+                f"(horizon={forecast_horizon})")
     logger.info(f"Features: {feature_names}")
 
-    return X, y, feature_names
+    return X, y, feature_names, target_dates
 
 
 def _classify_feature(name: str) -> str:
@@ -917,7 +941,7 @@ def train_and_save(config: dict) -> tuple:
     target = config["features"]["target"]
 
     # Build feature matrix
-    X, y, feature_names = build_feature_matrix(df, target)
+    X, y, feature_names, target_dates = build_feature_matrix(df, target)
 
     # ── Optional stepwise BIC feature selection ───────────────────────────────
     if model_cfg.get("stepwise_selection", False):

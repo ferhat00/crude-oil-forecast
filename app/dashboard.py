@@ -106,7 +106,7 @@ def build_predictive_dist(
     feature_names = load_features(root)
     sub_names = load_sub_feature_names(root)
 
-    X_full, y, all_names = build_feature_matrix(df, target)
+    X_full, y, all_names, _target_dates = build_feature_matrix(df, target)
     name_to_idx = {n: i for i, n in enumerate(all_names)}
     col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
@@ -162,7 +162,7 @@ def compute_calibrated_sigma_scale(
     cfg = load_config()
     target = cfg["features"]["target"]
     feature_names = load_features(root)
-    X_full, y, all_names = build_feature_matrix(df, target)
+    X_full, y, all_names, _target_dates = build_feature_matrix(df, target)
     name_to_idx = {n: i for i, n in enumerate(all_names)}
     col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
@@ -229,13 +229,17 @@ def main():
         return
 
     target = config["features"]["target"]
-    X_full, y, all_feature_names = build_feature_matrix(df, target)
+    X_full, y, all_feature_names, target_dates = build_feature_matrix(df, target)
 
     # Restrict to the columns the model was trained on (stepwise may have
     # dropped features; saved feature_names reflects the final selection).
     name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
     col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
+
+    # Latest feature row for live forecast (dropped by horizon shift)
+    X_full_latest, _, _, _ = build_feature_matrix(df, target, forecast_horizon=0)
+    X_latest = X_full_latest[-1:, :][:, col_idx]
 
     # Load distributional sub-models (sigma, nu, tau) if available
     all_models = load_all_gam_models_cached(root)
@@ -345,12 +349,31 @@ def main():
             col3.metric("30-Day Volatility", f"${vol_30:.2f}")
             col4.metric("Data Points", f"{len(df_filtered):,}")
 
+        # Next-day forecast using the latest available features
+        st.markdown("---")
+        st.subheader("Next-Day Forecast")
+        forecast_mu = float(gam.predict(X_latest)[0])
+        X_sigma_latest = X_latest[:, sigma_col_idx] if sigma_gam_model is not None and "sigma" in sub_names else None
+        forecast_sigma = float(_get_sigma_from_gam(
+            gam, X_latest, sigma_scale=sigma_scale,
+            sigma_gam=sigma_gam_model, X_sigma=X_sigma_latest,
+        )[0])
+        forecast_date = df.index[-1] + pd.offsets.BDay(1)
+        fcol1, fcol2, fcol3 = st.columns(3)
+        fcol1.metric("Forecast Date", f"{forecast_date.date()}")
+        fcol2.metric("Point Forecast", f"${forecast_mu:.2f}",
+                     delta=f"${forecast_mu - latest:.2f} vs last close",
+                     delta_color="normal")
+        fcol3.metric("95% Prediction Interval",
+                     f"${forecast_mu - 1.96 * forecast_sigma:.2f} — "
+                     f"${forecast_mu + 1.96 * forecast_sigma:.2f}")
+
     # ── Tab 2: Model Performance ──────────────────────────────────────────────
     with tab2:
-        st.subheader("Forecast vs Actual")
+        st.subheader("Forecast vs Actual (1-Day-Ahead)")
         ci_95 = gam.prediction_intervals(X, width=0.95)
         st.plotly_chart(
-            plot_forecast_vs_actual(df.index, y, y_pred, ci_95[:, 0], ci_95[:, 1]),
+            plot_forecast_vs_actual(target_dates, y, y_pred, ci_95[:, 0], ci_95[:, 1]),
             use_container_width=True,
         )
 
@@ -404,7 +427,7 @@ def main():
             )
             st.plotly_chart(
                 plot_fan_chart_plotly(
-                    df.index, y, y_pred, gam, X,
+                    target_dates, y, y_pred, gam, X,
                     last_n_days=fan_days,
                     dist=dist,
                     sigma_scale=sigma_scale,
@@ -419,8 +442,8 @@ def main():
                 "that day's forecast."
             )
 
-            # Date picker scoped to available dates
-            available_dates = df.index.date
+            # Date picker scoped to target dates (the dates being predicted)
+            available_dates = target_dates.date
             default_date = available_dates[-1]
             selected_date = st.date_input(
                 "Select date",
@@ -432,8 +455,8 @@ def main():
 
             # Find the nearest available index
             ts = pd.Timestamp(selected_date)
-            idx = df.index.searchsorted(ts)
-            idx = min(idx, len(df) - 1)
+            idx = target_dates.searchsorted(ts)
+            idx = min(idx, len(target_dates) - 1)
 
             mu_sel = float(y_pred[idx])
             sigma_sel = float(sigma[idx])
@@ -444,7 +467,7 @@ def main():
                     mu=mu_sel,
                     sigma=sigma_sel,
                     y_actual=actual_sel,
-                    title=f"Predictive Distribution — {df.index[idx].date()}",
+                    title=f"Predictive Distribution — {target_dates[idx].date()}",
                     dist=dist,
                 ),
                 use_container_width=True,
@@ -497,7 +520,7 @@ def main():
             "**probability distribution** respond. The baseline is the most recent observation."
         )
 
-        base_X = X[-1:].copy()
+        base_X = X_latest.copy()
         current_pred = gam.predict(base_X)[0]
         current_sigma = float(_get_sigma_from_gam(gam, base_X, sigma_scale=sigma_scale)[0])
 

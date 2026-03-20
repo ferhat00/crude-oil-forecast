@@ -90,36 +90,52 @@ class TestClassifyFeature:
 
 class TestBuildFeatureMatrix:
     def test_excludes_target(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert "CL=F_close" not in names
 
     def test_excludes_raw_ohlcv(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert "CL=F_open" not in names
         assert "CL=F_volume" not in names
 
     def test_output_shapes(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
-        assert X.shape[0] == len(sample_feature_df)
+        X, y, names, target_dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        # Default horizon=1 drops the last row (target unknown)
+        assert X.shape[0] == len(sample_feature_df) - 1
         assert X.shape[1] == len(names)
+        assert y.shape[0] == len(sample_feature_df) - 1
+        assert len(target_dates) == X.shape[0]
+
+    def test_output_shapes_horizon_zero(self, sample_feature_df, sample_config):
+        X, y, names, target_dates = build_feature_matrix(
+            sample_feature_df, "CL=F_close", forecast_horizon=0
+        )
+        assert X.shape[0] == len(sample_feature_df)
         assert y.shape[0] == len(sample_feature_df)
+        assert len(target_dates) == len(sample_feature_df)
+
+    def test_target_dates_shifted(self, sample_feature_df, sample_config):
+        X, y, names, target_dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        # target_dates should be the actual next trading day from the index
+        assert target_dates[0] == sample_feature_df.index[1]
+        assert target_dates[-1] == sample_feature_df.index[-1]
 
     def test_feature_names_list(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert isinstance(names, list)
         assert all(isinstance(n, str) for n in names)
 
 
 class TestDefineGamTerms:
     def test_returns_terms_object(self, sample_feature_df, sample_config):
-        _, _, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        _, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         assert terms is not None
 
 
 class TestFitGam:
     def test_fit_on_synthetic_data(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         predictions = gam.predict(X)
@@ -129,7 +145,7 @@ class TestFitGam:
 
 class TestCrossValidate:
     def test_cv_returns_correct_structure(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         results = cross_validate(X, y, terms, n_splits=3, embargo_days=5, lam_values=[0.1, 1])
 
@@ -144,7 +160,7 @@ class TestCrossValidate:
 
 class TestComputeBic:
     def test_bic_greater_than_aic_for_large_n(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         bic = compute_bic(gam, len(y))
@@ -153,7 +169,7 @@ class TestComputeBic:
         assert bic >= aic
 
     def test_bic_returns_float(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[1])
         assert isinstance(compute_bic(gam, len(y)), float)
@@ -161,7 +177,7 @@ class TestComputeBic:
 
 class TestStepwiseBIC:
     def test_bic_stepwise_reduces_features(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         n_orig = len(names)
         X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
             X, y, names, sample_config,
@@ -174,7 +190,7 @@ class TestStepwiseBIC:
         assert X_sel.shape[1] == len(sel_names)
 
     def test_aic_stepwise_still_works(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
             X, y, names, sample_config,
             lam_values=[0.1, 1],
@@ -186,7 +202,7 @@ class TestStepwiseBIC:
 
 class TestSigmaModel:
     def test_select_sigma_features(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_sig, sig_names, indices = select_sigma_features(names, X)
         # At least _std_ should match CL=F_close_std_14
         assert len(sig_names) >= 1
@@ -194,7 +210,7 @@ class TestSigmaModel:
         assert all(n in names for n in sig_names)
 
     def test_fit_sigma_gam(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         residuals = y - gam.predict(X)
@@ -221,7 +237,7 @@ class TestNuTauModels:
         assert np.all(tau_vals > 0)
 
     def test_select_nu_tau_features_fallback(self, sample_feature_df, sample_config):
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         # sample_feature_df has no ovx/vix/hy_spread — should fallback gracefully
         X_nt, nt_names, indices = select_nu_tau_features(names, X)
         assert X_nt.shape[0] == X.shape[0]
@@ -229,7 +245,7 @@ class TestNuTauModels:
 
     def test_fit_distributional_gam(self, sample_feature_df, sample_config):
         rng = np.random.default_rng(1)
-        X, y, names = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_nt, nt_names, _ = select_nu_tau_features(names, X)
         std_res = rng.standard_normal(len(y))
         valid_mask, rolling_nu, _ = compute_rolling_nu_tau(std_res, window=30)

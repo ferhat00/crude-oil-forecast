@@ -867,7 +867,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
 
     # Build the full feature matrix, then restrict to the columns the model
     # was actually trained on (stepwise selection may have dropped features).
-    X_full, y, all_feature_names = build_feature_matrix(df, target)
+    X_full, y, all_feature_names, target_dates = build_feature_matrix(df, target)
     saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
     feature_names = (
         load_feature_names(saved_names_path)
@@ -900,7 +900,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
     print_gam_statistics(gam)
 
     # ── Standard plots ────────────────────────────────────────────────────────
-    plot_actual_vs_predicted(df.index, y, y_gam, fig_dir / "actual_vs_pred.png")
+    plot_actual_vs_predicted(target_dates, y, y_gam, fig_dir / "actual_vs_pred.png")
     plot_residual_diagnostics(y, y_gam, fig_dir / "residuals.png")
 
     # ── Fit 4-parameter Johnson SU predictive distribution ───────────────────
@@ -910,7 +910,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
 
     # ── Probability forecast plots ────────────────────────────────────────────
     # Fan chart (last 500 trading days) — Johnson SU bands
-    plot_fan_chart(df.index, y, y_gam, gam, X,
+    plot_fan_chart(target_dates, y, y_gam, gam, X,
                    save_path=fig_dir / "fan_chart.png",
                    dist=dist)
 
@@ -920,7 +920,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
         sigma=float(sigma[-1]),
         y_actual=float(y[-1]),
         save_path=fig_dir / "predictive_density.png",
-        title="Predictive Distribution — Most Recent Observation",
+        title=f"Predictive Distribution — {target_dates[-1].date()}",
         dist=dist,
     )
 

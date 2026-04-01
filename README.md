@@ -41,7 +41,7 @@ All raw data is merged (EIA weekly/monthly data is forward-filled to daily) and 
 | 10 | **Brent–WTI spread** | Spread, % spread, ratio, 14-day rolling mean/std |
 | 11 | **Crack spreads** | Gasoline and heating-oil crack spreads; 3-2-1 refinery benchmark |
 
-The first ~200 rows are dropped as warm-up for the longest rolling windows. The finished dataset is saved to `data/processed/features.parquet`.
+After all features are computed the target column is **forward-shifted by 1 trading day** (`shift(-1)`), so each row's `y` value is the *next* day's closing price. This makes the model a genuine T+1 next-day forecast: today's features → tomorrow's close. The last row (whose target becomes NaN after the shift) is dropped together with the ~200 warm-up rows via `dropna()`. The finished dataset is saved to `data/processed/features.parquet`.
 
 ### Stage 3 — EDA (optional)
 

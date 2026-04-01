@@ -542,3 +542,32 @@ class TestSeasonalFlags:
             {"driving_season": False, "heating_season": False, "us_holidays": False},
         )
         assert set(result.columns) == before_cols
+
+
+class TestTargetForwardShift:
+    """Verify that the T+1 forward shift applied in build_features() is correct."""
+
+    def test_target_row_i_equals_original_row_i_plus_1(self, sample_oil_df):
+        """After shift(-1), target[i] must equal the original close at row i+1."""
+        df = sample_oil_df.copy()
+        original_close = df["CL=F_close"].copy()
+
+        # Replicate the shift performed in build_features()
+        df["CL=F_close"] = df["CL=F_close"].shift(-1)
+
+        # All rows except the last should equal original[i+1]
+        for i in range(len(df) - 1):
+            assert df["CL=F_close"].iloc[i] == original_close.iloc[i + 1]
+
+    def test_last_row_target_is_nan_after_shift(self, sample_oil_df):
+        """The last row should have NaN as target after the forward shift."""
+        df = sample_oil_df.copy()
+        df["CL=F_close"] = df["CL=F_close"].shift(-1)
+        assert pd.isna(df["CL=F_close"].iloc[-1])
+
+    def test_dropna_removes_last_row(self, sample_oil_df):
+        """dropna() after the shift should remove exactly 1 row (the last one)."""
+        df = sample_oil_df.copy()
+        df["CL=F_close"] = df["CL=F_close"].shift(-1)
+        df_clean = df.dropna()
+        assert len(df_clean) == len(sample_oil_df) - 1

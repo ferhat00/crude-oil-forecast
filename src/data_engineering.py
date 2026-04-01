@@ -692,8 +692,12 @@ def add_seasonal_flags(
 def build_features(config: dict) -> pd.DataFrame:
     """Run the full feature engineering pipeline.
 
-    Loads raw parquet files, merges, creates all features, drops NaN rows,
-    and saves the result to data/processed/features.parquet.
+    Loads raw parquet files, merges, creates all features, forward-shifts the
+    target by 1 trading day (T+1 forecast horizon), drops NaN rows, and saves
+    the result to data/processed/features.parquet.
+
+    The forward shift means each row's target value is tomorrow's close price,
+    so the model learns to predict the *next* day's close from today's features.
 
     Feature groups created:
     - Autoregressive lags of the target (t-1, t-3, t-7, t-30)
@@ -911,7 +915,10 @@ def build_features(config: dict) -> pd.DataFrame:
     if wti_col:
         df = add_crack_spread_features(df, wti_col, gasoline_col, heating_oil_col)
 
-    # ── Drop warm-up NaN rows ─────────────────────────
+    # ── Shift target forward by 1 day: predict tomorrow's close using today's features
+    df[target_col] = df[target_col].shift(-1)
+
+    # ── Drop warm-up NaN rows (also removes the last row whose target is now NaN) ──
     before = len(df)
     df = df.dropna()
     logger.info(f"Dropped {before - len(df)} rows (warm-up period)")

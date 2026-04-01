@@ -914,13 +914,19 @@ def run_evaluation(config: dict) -> pd.DataFrame:
                    save_path=fig_dir / "fan_chart.png",
                    dist=dist)
 
-    # Predictive density for the most recent observation — Johnson SU curve
+    # Genuine T+1 forecast: predict tomorrow using today's (last available) features
+    X_full_0, _, _, _ = build_feature_matrix(df, target, forecast_horizon=0)
+    X_latest = X_full_0[-1:, col_idx]
+    mu_tomorrow = float(gam.predict(X_latest)[0])
+    sigma_tomorrow = float(get_prediction_sigma(gam, X_latest)[0])
+    tomorrow_date = df.index[-1] + pd.offsets.BDay(1)
+
     plot_predictive_density(
-        mu=float(y_gam[-1]),
-        sigma=float(sigma[-1]),
-        y_actual=float(y[-1]),
+        mu=mu_tomorrow,
+        sigma=sigma_tomorrow,
+        y_actual=None,   # outcome is unknown; no red marker drawn
         save_path=fig_dir / "predictive_density.png",
-        title=f"Predictive Distribution — {target_dates[-1].date()}",
+        title=f"Predictive Distribution — {tomorrow_date.date()}",
         dist=dist,
     )
 

@@ -545,29 +545,42 @@ class TestSeasonalFlags:
 
 
 class TestTargetForwardShift:
-    """Verify that the T+1 forward shift applied in build_features() is correct."""
+    """Verify that build_feature_matrix applies the T+1 shift correctly."""
 
-    def test_target_row_i_equals_original_row_i_plus_1(self, sample_oil_df):
-        """After shift(-1), target[i] must equal the original close at row i+1."""
-        df = sample_oil_df.copy()
-        original_close = df["CL=F_close"].copy()
+    def _make_df(self):
+        """Minimal DataFrame that satisfies build_feature_matrix column rules."""
+        from src.model import build_feature_matrix
 
-        # Replicate the shift performed in build_features()
-        df["CL=F_close"] = df["CL=F_close"].shift(-1)
+        dates = pd.date_range("2023-01-02", periods=20, freq="B")
+        rng = np.random.default_rng(0)
+        close = 70 + rng.standard_normal(20).cumsum()
+        # One engineered feature (lag) so feature matrix is non-empty
+        lag1 = pd.Series(close).shift(1).values
+        return pd.DataFrame(
+            {"CL=F_close": close, "CL=F_close_lag_1": lag1},
+            index=dates,
+        ), build_feature_matrix
 
-        # All rows except the last should equal original[i+1]
-        for i in range(len(df) - 1):
-            assert df["CL=F_close"].iloc[i] == original_close.iloc[i + 1]
+    def test_target_row_i_equals_original_row_i_plus_1(self):
+        """y[i] must equal the raw close at row i+1 (T+1 semantics)."""
+        df, build_feature_matrix = self._make_df()
+        raw_close = df["CL=F_close"].values.copy()
+        _, y, _, _ = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
+        # y comes from raw_close[1:], so y[i] == raw_close[i+1]
+        np.testing.assert_array_equal(y, raw_close[1:])
 
-    def test_last_row_target_is_nan_after_shift(self, sample_oil_df):
-        """The last row should have NaN as target after the forward shift."""
-        df = sample_oil_df.copy()
-        df["CL=F_close"] = df["CL=F_close"].shift(-1)
-        assert pd.isna(df["CL=F_close"].iloc[-1])
+    def test_feature_row_i_predicts_target_i_plus_1(self):
+        """X has n-1 rows; target_dates[i] is the date of raw_close[i+1]."""
+        df, build_feature_matrix = self._make_df()
+        X, y, _, target_dates = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
+        assert len(X) == len(df) - 1
+        assert len(y) == len(df) - 1
+        # target_dates[0] is the second calendar date (the day being predicted)
+        assert target_dates[0] == df.index[1]
 
-    def test_dropna_removes_last_row(self, sample_oil_df):
-        """dropna() after the shift should remove exactly 1 row (the last one)."""
-        df = sample_oil_df.copy()
-        df["CL=F_close"] = df["CL=F_close"].shift(-1)
-        df_clean = df.dropna()
-        assert len(df_clean) == len(sample_oil_df) - 1
+    def test_horizon_zero_returns_all_rows(self):
+        """forecast_horizon=0 must not drop any rows (used for live prediction)."""
+        df, build_feature_matrix = self._make_df()
+        df_clean = df.dropna()  # drop the NaN lag row
+        X, y, _, _ = build_feature_matrix(df_clean, "CL=F_close", forecast_horizon=0)
+        assert len(X) == len(df_clean)

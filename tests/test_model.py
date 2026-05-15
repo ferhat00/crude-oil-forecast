@@ -6,17 +6,26 @@ import pytest
 
 from src.config_loader import resolve_model_config
 from src.model import (
+    SkewedFeatureTransformer,
     _classify_feature,
+    _get_monotonic_constraint,
+    _is_skewed_feature,
     build_feature_matrix,
+    compute_anchor_prices,
     compute_bic,
     compute_rolling_nu_tau,
+    conformal_residual_quantile,
     cross_validate,
     define_gam_terms,
+    drop_correlated_features,
     fit_distributional_gam,
     fit_gam,
     fit_sigma_gam,
+    get_target_y_level,
+    reconstruct_price_from_returns,
     select_sigma_features,
     select_nu_tau_features,
+    stationary_bootstrap_indices,
     stepwise_aic_selection,
 )
 
@@ -256,6 +265,170 @@ class TestNuTauModels:
         )
         preds = nu_gam.predict(X_valid[:, sel_idx])
         assert len(preds) == X_valid.shape[0]
+
+
+class TestLogReturnTarget:
+    """Item 1: build_feature_matrix with target_transform='log_return'."""
+
+    def test_log_return_target_y_in_return_space(self, sample_feature_df):
+        X, y, names, dates = build_feature_matrix(
+            sample_feature_df, "CL=F_close", target_transform="log_return",
+        )
+        # log-returns of a near-random walk should be O(1e-2) — not in the 60-80 range
+        assert np.all(np.abs(y) < 1.0)
+        # Manually verified relationship
+        prices = sample_feature_df["CL=F_close"].values
+        expected_y0 = np.log(prices[1] / prices[0])
+        np.testing.assert_almost_equal(y[0], expected_y0, decimal=10)
+
+    def test_log_return_drops_level_lag_features(self, sample_feature_df):
+        X_lvl, _, names_lvl, _ = build_feature_matrix(
+            sample_feature_df, "CL=F_close", target_transform="level",
+        )
+        X_ret, _, names_ret, _ = build_feature_matrix(
+            sample_feature_df, "CL=F_close", target_transform="log_return",
+        )
+        # Level-mode keeps the lag features; log-return mode drops them
+        assert "CL=F_close_lag_1" in names_lvl
+        assert "CL=F_close_lag_1" not in names_ret
+        assert "CL=F_close_lag_7" in names_lvl
+        assert "CL=F_close_lag_7" not in names_ret
+
+    def test_anchor_and_y_level_alignment(self, sample_feature_df):
+        anchor = compute_anchor_prices(sample_feature_df, "CL=F_close", forecast_horizon=1)
+        y_level = get_target_y_level(sample_feature_df, "CL=F_close", forecast_horizon=1)
+        prices = sample_feature_df["CL=F_close"].values
+        # anchor[i] = price[i]; y_level[i] = price[i+1]
+        np.testing.assert_array_equal(anchor, prices[:-1])
+        np.testing.assert_array_equal(y_level, prices[1:])
+
+    def test_reconstruct_price_round_trip(self, sample_feature_df):
+        _, y_ret, _, _ = build_feature_matrix(
+            sample_feature_df, "CL=F_close", target_transform="log_return",
+        )
+        anchor = compute_anchor_prices(sample_feature_df, "CL=F_close", forecast_horizon=1)
+        y_level = get_target_y_level(sample_feature_df, "CL=F_close", forecast_horizon=1)
+        reconstructed = reconstruct_price_from_returns(y_ret, anchor)
+        np.testing.assert_allclose(reconstructed, y_level, rtol=1e-10)
+
+    def test_unknown_transform_raises(self, sample_feature_df):
+        with pytest.raises(ValueError, match="Unknown target_transform"):
+            build_feature_matrix(
+                sample_feature_df, "CL=F_close", target_transform="not_a_transform",
+            )
+
+
+class TestSkewedFeaturePatterns:
+    def test_returns_are_skewed(self):
+        assert _is_skewed_feature("CL=F_close_log_return")
+        assert _is_skewed_feature("CL=F_close_pct_change")
+
+    def test_oscillators_are_skewed(self):
+        assert _is_skewed_feature("CL=F_close_rsi_14")
+        assert _is_skewed_feature("CL=F_close_williams_r_14")
+        assert _is_skewed_feature("CL=F_close_stoch_k_14")
+
+    def test_macro_not_skewed(self):
+        assert not _is_skewed_feature("usd_index")
+        assert not _is_skewed_feature("fed_funds")
+
+
+class TestSkewedFeatureTransformer:
+    def test_transform_round_shape(self, sample_feature_df):
+        X, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
+        t = SkewedFeatureTransformer(names).fit(X)
+        Xt = t.transform(X)
+        assert Xt.shape == X.shape
+
+    def test_skewed_columns_become_uniform(self, sample_feature_df):
+        X, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
+        t = SkewedFeatureTransformer(names).fit(X)
+        Xt = t.transform(X)
+        # Pick a skewed column (pct_change in our fixture)
+        if "CL=F_close_pct_change" in names:
+            j = names.index("CL=F_close_pct_change")
+            # Transformed column should be roughly uniform on [0, 1]
+            col = Xt[:, j]
+            assert col.min() >= 0.0
+            assert col.max() <= 1.0
+            # Mean of uniform(0,1) is 0.5; allow generous tolerance for small n
+            assert 0.3 < float(np.mean(col)) < 0.7
+
+
+class TestMonotonicLookup:
+    def test_inventory_decreases_price(self):
+        assert _get_monotonic_constraint("crude_stocks") == "monotonic_dec"
+        assert _get_monotonic_constraint("cushing_stocks") == "monotonic_dec"
+
+    def test_dxy_decreases_price(self):
+        assert _get_monotonic_constraint("usd_index") == "monotonic_dec"
+
+    def test_refinery_increases_price(self):
+        assert _get_monotonic_constraint("refinery_utilization") == "monotonic_inc"
+
+    def test_unknown_returns_none(self):
+        assert _get_monotonic_constraint("vix_close") is None
+        assert _get_monotonic_constraint("CL=F_close_rsi_14") is None
+
+
+class TestCollinearityPruning:
+    def test_drops_perfectly_correlated_duplicate(self):
+        rng = np.random.default_rng(0)
+        n = 200
+        x = rng.standard_normal(n)
+        X = np.column_stack([x, x + 1e-9, rng.standard_normal(n)])
+        names = ["a", "a_dup", "b"]
+        keep, kept_names, dropped = drop_correlated_features(X, names, threshold=0.97)
+        assert "a" in kept_names
+        assert "b" in kept_names
+        assert "a_dup" in dropped
+
+    def test_no_drops_when_uncorrelated(self):
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((300, 4))
+        names = list("abcd")
+        keep, kept_names, dropped = drop_correlated_features(X, names, threshold=0.97)
+        assert dropped == []
+        assert kept_names == names
+
+
+class TestStationaryBootstrap:
+    def test_indices_have_correct_length(self):
+        idx = stationary_bootstrap_indices(100, mean_block_length=10,
+                                           rng=np.random.default_rng(0))
+        assert len(idx) == 100
+
+    def test_indices_in_range(self):
+        idx = stationary_bootstrap_indices(50, mean_block_length=5,
+                                           rng=np.random.default_rng(0))
+        assert idx.min() >= 0
+        assert idx.max() < 50
+
+
+class TestConformalQuantile:
+    def test_perfect_predictions_yield_zero_quantile(self):
+        y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        y_pred = y_true.copy()
+        q = conformal_residual_quantile(y_true, y_pred, alpha=0.1)
+        assert q == 0.0
+
+    def test_quantile_increases_with_errors(self):
+        rng = np.random.default_rng(0)
+        y = rng.standard_normal(500)
+        small_err = y + rng.standard_normal(500) * 0.1
+        big_err = y + rng.standard_normal(500) * 1.0
+        q_small = conformal_residual_quantile(y, small_err, alpha=0.1)
+        q_big = conformal_residual_quantile(y, big_err, alpha=0.1)
+        assert q_big > q_small
+
+    def test_alpha_changes_quantile(self):
+        rng = np.random.default_rng(2)
+        y = rng.standard_normal(500)
+        y_pred = y + rng.standard_normal(500) * 0.5
+        q_90 = conformal_residual_quantile(y, y_pred, alpha=0.10)
+        q_99 = conformal_residual_quantile(y, y_pred, alpha=0.01)
+        # Tighter alpha → larger nonconformity quantile
+        assert q_99 > q_90
 
 
 class TestResolveModelConfig:

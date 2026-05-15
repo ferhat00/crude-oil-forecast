@@ -23,11 +23,16 @@ from app.components import (
     plot_what_if_analysis,
     _get_sigma_from_gam,
 )
+import joblib
+from src.backtest import load_backtest_path, run_walk_forward_backtest
+from src.combination import combine_forecasts, fit_from_backtest, load_weights as load_combo_weights
 from src.config_loader import load_config
 from src.evaluation import (
     PredictiveDistribution,
     calibrate_sigma_scale,
     compute_metrics,
+    compute_probabilistic_scores,
+    directional_accuracy,
     fit_residual_distribution,
     get_prediction_sigma,
     naive_baseline_predictions,
@@ -35,16 +40,48 @@ from src.evaluation import (
 from src.model import (
     _classify_feature,
     build_feature_matrix,
+    compute_anchor_prices,
+    get_target_y_level,
     load_all_models,
     load_feature_names,
     load_model,
     get_sigma_from_sigma_gam,
+    reconstruct_price_from_returns,
 )
 
 
 @st.cache_data
 def load_data(root: str) -> pd.DataFrame:
     return pd.read_parquet(Path(root) / "data" / "processed" / "features.parquet")
+
+
+@st.cache_resource
+def load_feature_transformer(root: str):
+    """Load SkewedFeatureTransformer if present; else return None."""
+    p = Path(root) / "outputs" / "models" / "feature_transformer.pkl"
+    if not p.exists():
+        return None
+    return joblib.load(p)
+
+
+@st.cache_resource
+def load_model_metadata(root: str) -> dict:
+    """Load metadata sidecar (target_transform, etc.); empty dict if missing."""
+    p = Path(root) / "outputs" / "models" / "model_metadata.pkl"
+    if not p.exists():
+        return {}
+    return joblib.load(p)
+
+
+def _to_price_space(
+    y_pred_model: np.ndarray,
+    anchor: np.ndarray,
+    target_transform: str,
+) -> np.ndarray:
+    """Convert raw model predictions to price-level space."""
+    if target_transform == "log_return":
+        return np.asarray(anchor) * np.exp(np.asarray(y_pred_model))
+    return np.asarray(y_pred_model)
 
 
 @st.cache_resource
@@ -89,7 +126,7 @@ def build_predictive_dist(
     _gam,
     _models: dict | None = None,
 ) -> PredictiveDistribution:
-    """Fit Johnson SU predictive distribution, incorporating sub-models when available.
+    """Fit Johnson SU predictive distribution in MODEL space.
 
     * **Sigma**: If a sigma sub-model is present the per-observation σ is computed
       via ``exp(sigma_gam.predict(X_sigma))`` instead of the GAM 95% PI width.
@@ -97,19 +134,29 @@ def build_predictive_dist(
       per-observation arrays from model predictions.  Otherwise globally fitted
       scalars are used (original behaviour).
 
+    Honours ``features.target_transform`` — when "log_return" the residuals are
+    fitted in return space.  Callers convert quantiles to price space via the
+    helpers in :mod:`app.components`.
+
     The leading underscore on ``_gam`` / ``_models`` prevents Streamlit from
     attempting to hash these objects; the result is keyed only on ``root``.
     """
     df = load_data(root)
     cfg = load_config()
     target = cfg["features"]["target"]
+    target_transform = cfg["features"].get("target_transform", "level")
     feature_names = load_features(root)
     sub_names = load_sub_feature_names(root)
 
-    X_full, y, all_names, _target_dates = build_feature_matrix(df, target)
+    X_full, y, all_names, _target_dates = build_feature_matrix(
+        df, target, target_transform=target_transform,
+    )
     name_to_idx = {n: i for i, n in enumerate(all_names)}
     col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
+    transformer = load_feature_transformer(root)
+    if transformer is not None:
+        X = transformer.transform(X)
     y_pred = _gam.predict(X)
 
     # ── Sigma ─────────────────────────────────────────────────────────────────
@@ -154,6 +201,9 @@ def compute_calibrated_sigma_scale(
 ) -> float:
     """Auto-calibrate sigma_scale so empirical coverage matches *target_coverage*.
 
+    Coverage is measured in MODEL space (whatever the GAM was trained on);
+    quantile mapping to price space is monotonic so coverage is preserved.
+
     The leading underscores on ``_gam`` and ``_dist`` prevent Streamlit from
     attempting to hash those objects; the result is keyed only on ``root`` and
     ``target_coverage``.
@@ -161,11 +211,17 @@ def compute_calibrated_sigma_scale(
     df = load_data(root)
     cfg = load_config()
     target = cfg["features"]["target"]
+    target_transform = cfg["features"].get("target_transform", "level")
     feature_names = load_features(root)
-    X_full, y, all_names, _target_dates = build_feature_matrix(df, target)
+    X_full, y, all_names, _target_dates = build_feature_matrix(
+        df, target, target_transform=target_transform,
+    )
     name_to_idx = {n: i for i, n in enumerate(all_names)}
     col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
     X = X_full[:, col_idx]
+    transformer = load_feature_transformer(root)
+    if transformer is not None:
+        X = transformer.transform(X)
     return calibrate_sigma_scale(_gam, X, y, _dist, target_coverage=target_coverage)
 
 
@@ -229,7 +285,10 @@ def main():
         return
 
     target = config["features"]["target"]
-    X_full, y, all_feature_names, target_dates = build_feature_matrix(df, target)
+    target_transform = config["features"].get("target_transform", "level")
+    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+        df, target, target_transform=target_transform,
+    )
 
     # Restrict to the columns the model was trained on (stepwise may have
     # dropped features; saved feature_names reflects the final selection).
@@ -238,8 +297,16 @@ def main():
     X = X_full[:, col_idx]
 
     # Latest feature row for live forecast (dropped by horizon shift)
-    X_full_latest, _, _, _ = build_feature_matrix(df, target, forecast_horizon=0)
+    X_full_latest, _, _, _ = build_feature_matrix(
+        df, target, forecast_horizon=0, target_transform=target_transform,
+    )
     X_latest = X_full_latest[-1:, :][:, col_idx]
+
+    # Apply the saved skewed-feature transformer (item 8) to both X paths
+    transformer = load_feature_transformer(root)
+    if transformer is not None:
+        X = transformer.transform(X)
+        X_latest = transformer.transform(X_latest)
 
     # Load distributional sub-models (sigma, nu, tau) if available
     all_models = load_all_gam_models_cached(root)
@@ -253,8 +320,16 @@ def main():
     else:
         sigma_gam_model, X_sigma = None, None
 
+    # Anchor and price-level series (always price USD/bbl)
+    anchor = compute_anchor_prices(df, target, forecast_horizon=1)
+    y_level = get_target_y_level(df, target, forecast_horizon=1)
+
     # Pre-compute predictions and fit Johnson SU distribution once
-    y_pred = gam.predict(X)
+    y_pred_model = gam.predict(X)
+    y_pred_price = _to_price_space(y_pred_model, anchor, target_transform)
+    # Backward-compat alias used throughout the rest of main()
+    y = y_level
+    y_pred = y_pred_price
     dist = build_predictive_dist(root, gam, _models=all_models)  # cached
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
@@ -320,13 +395,14 @@ def main():
         sigma_gam=sigma_gam_model, X_sigma=X_sigma,
     )
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Price Overview",
         "Model Performance",
         "Probability Forecast",
         "Partial Dependence",
         "What-If Analysis",
         "Model Terms",
+        "Backtest",
     ])
 
     # ── Tab 1: Price Overview ─────────────────────────────────────────────────
@@ -352,35 +428,63 @@ def main():
         # Next-day forecast using the latest available features
         st.markdown("---")
         st.subheader("Next-Day Forecast")
-        forecast_mu = float(gam.predict(X_latest)[0])
+        forecast_mu_model = float(gam.predict(X_latest)[0])
         X_sigma_latest = X_latest[:, sigma_col_idx] if sigma_gam_model is not None and "sigma" in sub_names else None
-        forecast_sigma = float(_get_sigma_from_gam(
+        forecast_sigma_model = float(_get_sigma_from_gam(
             gam, X_latest, sigma_scale=sigma_scale,
             sigma_gam=sigma_gam_model, X_sigma=X_sigma_latest,
         )[0])
+        # Reconstruct to price space when needed
+        last_close = float(df[target].iloc[-1])
+        if target_transform == "log_return":
+            forecast_mu_price = last_close * float(np.exp(forecast_mu_model))
+            pi_lo = last_close * float(np.exp(forecast_mu_model - 1.96 * forecast_sigma_model))
+            pi_hi = last_close * float(np.exp(forecast_mu_model + 1.96 * forecast_sigma_model))
+        else:
+            forecast_mu_price = forecast_mu_model
+            pi_lo = forecast_mu_price - 1.96 * forecast_sigma_model
+            pi_hi = forecast_mu_price + 1.96 * forecast_sigma_model
         forecast_date = df.index[-1] + pd.offsets.BDay(1)
         fcol1, fcol2, fcol3 = st.columns(3)
         fcol1.metric("Forecast Date", f"{forecast_date.date()}")
-        fcol2.metric("Point Forecast", f"${forecast_mu:.2f}",
-                     delta=f"${forecast_mu - latest:.2f} vs last close",
+        fcol2.metric("Point Forecast", f"${forecast_mu_price:.2f}",
+                     delta=f"${forecast_mu_price - latest:.2f} vs last close",
                      delta_color="normal")
-        fcol3.metric("95% Prediction Interval",
-                     f"${forecast_mu - 1.96 * forecast_sigma:.2f} — "
-                     f"${forecast_mu + 1.96 * forecast_sigma:.2f}")
+        fcol3.metric("95% Prediction Interval", f"${pi_lo:.2f} — ${pi_hi:.2f}")
+        if target_transform == "log_return":
+            st.caption(
+                f"Target space: log-return; predicted r̂ = {forecast_mu_model:+.4f} "
+                f"(σ̂ = {forecast_sigma_model:.4f}).  "
+                "Price reconstructed via P̂ = P_t · exp(r̂)."
+            )
 
     # ── Tab 2: Model Performance ──────────────────────────────────────────────
     with tab2:
         st.subheader("Forecast vs Actual (1-Day-Ahead)")
-        ci_95 = gam.prediction_intervals(X, width=0.95)
+        # Build 95% PI in price space directly from Johnson SU quantiles
+        sigma_for_ci = _get_sigma_from_gam(
+            gam, X, sigma_scale=sigma_scale,
+            sigma_gam=sigma_gam_model, X_sigma=X_sigma,
+        )
+        if target_transform == "log_return":
+            r_lo = dist.ppf_array(0.025, y_pred_model, sigma_for_ci)
+            r_hi = dist.ppf_array(0.975, y_pred_model, sigma_for_ci)
+            ci_lo_price = anchor * np.exp(r_lo)
+            ci_hi_price = anchor * np.exp(r_hi)
+        else:
+            ci_lo_price = dist.ppf_array(0.025, y_pred_model, sigma_for_ci)
+            ci_hi_price = dist.ppf_array(0.975, y_pred_model, sigma_for_ci)
         st.plotly_chart(
-            plot_forecast_vs_actual(target_dates, y, y_pred, ci_95[:, 0], ci_95[:, 1]),
+            plot_forecast_vs_actual(target_dates, y, y_pred, ci_lo_price, ci_hi_price),
             use_container_width=True,
         )
 
-        st.subheader("Metrics Comparison")
+        st.subheader("Metrics Comparison (price scale)")
         y_naive = naive_baseline_predictions(y)
         gam_metrics = compute_metrics(y, y_pred)
         naive_metrics = compute_metrics(y[1:], y_naive[1:])
+        dir_gam = directional_accuracy(y, y_pred, anchor)
+        dir_naive = directional_accuracy(y[1:], y_naive[1:], anchor[1:])
 
         col1, col2 = st.columns(2)
         with col1:
@@ -388,13 +492,39 @@ def main():
             st.metric("MAE",  f"${gam_metrics['mae']:.2f}")
             st.metric("RMSE", f"${gam_metrics['rmse']:.2f}")
             st.metric("MAPE", f"{gam_metrics['mape']:.2f}%")
+            st.metric("Directional accuracy", f"{dir_gam * 100:.1f}%")
         with col2:
             st.markdown("**Naive Baseline** (tomorrow = today)")
             st.metric("MAE",  f"${naive_metrics['mae']:.2f}")
             st.metric("RMSE", f"${naive_metrics['rmse']:.2f}")
             st.metric("MAPE", f"{naive_metrics['mape']:.2f}%")
+            st.metric("Directional accuracy", f"{dir_naive * 100:.1f}%")
 
-        st.subheader("Residual Distribution")
+        # ── Probabilistic scores (item 13) ────────────────────────────────────
+        with st.expander("Probabilistic scores (CRPS / pinball / log-score / coverage)"):
+            with st.spinner("Computing probabilistic scores…"):
+                prob = compute_probabilistic_scores(
+                    y_true=y_model,
+                    y_pred_mu=y_pred_model,
+                    sigma=sigma_for_ci,
+                    dist=dist,
+                    y_anchor=np.zeros_like(y_model) if target_transform == "log_return" else anchor,
+                    n_crps_samples=200,
+                )
+            prob_df = pd.DataFrame(
+                [(k, v) for k, v in prob.items()],
+                columns=["metric", "value"],
+            )
+            st.dataframe(prob_df.style.format({"value": "{:.4f}"}),
+                         use_container_width=True, hide_index=True)
+            st.caption(
+                "All probabilistic scores are computed in MODEL space "
+                f"({'log-return' if target_transform == 'log_return' else 'price'}); "
+                "lower CRPS / pinball / log-score = better.  "
+                "Coverage values should be close to their nominal level."
+            )
+
+        st.subheader("Residual Distribution (price scale)")
         residuals = y - y_pred
         fig_r = go.Figure(go.Histogram(
             x=residuals, nbinsx=80,
@@ -425,12 +555,19 @@ def main():
                 "Confidence bands from darkest (50% PI) to lightest (95% PI). "
                 "The actual price should fall inside the 95% band about 95% of the time."
             )
+            from app.components import plot_fan_chart_price_space_plotly
             st.plotly_chart(
-                plot_fan_chart_plotly(
-                    target_dates, y, y_pred, gam, X,
-                    last_n_days=fan_days,
+                plot_fan_chart_price_space_plotly(
+                    dates=target_dates,
+                    y_true_price=y_level,
+                    y_pred_price=y_pred_price,
+                    y_pred_model=y_pred_model,
+                    sigma_model=sigma,
+                    anchor=anchor,
                     dist=dist,
-                    sigma_scale=sigma_scale,
+                    last_n_days=fan_days,
+                    target_transform=target_transform,
+                    sigma_scale=1.0,  # sigma already scaled above
                 ),
                 use_container_width=True,
             )
@@ -458,37 +595,43 @@ def main():
             idx = target_dates.searchsorted(ts)
             idx = min(idx, len(target_dates) - 1)
 
-            mu_sel = float(y_pred[idx])
+            mu_model_sel = float(y_pred_model[idx])
             sigma_sel = float(sigma[idx])
-            actual_sel = float(y[idx])
+            actual_price_sel = float(y_level[idx])
+            anchor_sel = float(anchor[idx])
+            mu_price_sel = float(y_pred_price[idx])
 
+            from app.components import plot_predictive_density_price_space_plotly
             st.plotly_chart(
-                plot_predictive_density_plotly(
-                    mu=mu_sel,
-                    sigma=sigma_sel,
-                    y_actual=actual_sel,
-                    title=f"Predictive Distribution — {target_dates[idx].date()}",
+                plot_predictive_density_price_space_plotly(
+                    mu_model=mu_model_sel,
+                    sigma_model=sigma_sel,
+                    anchor=anchor_sel,
                     dist=dist,
+                    y_actual_price=actual_price_sel,
+                    title=f"Predictive Distribution — {target_dates[idx].date()}",
+                    target_transform=target_transform,
+                    obs_idx=idx,
                 ),
                 use_container_width=True,
             )
 
-            # Summary stats — use Johnson SU CDF when available, else Normal
-            if dist is not None:
-                pctile = float(dist.cdf(actual_sel, mu_sel, sigma_sel, idx=idx) * 100)
-                _nu_disp = float(dist.nu[idx]) if isinstance(dist.nu, np.ndarray) else float(dist.nu)
-                _tau_disp = float(dist.tau[idx]) if isinstance(dist.tau, np.ndarray) else float(dist.tau)
-                dist_note = f"ν={_nu_disp:.2f}, τ={_tau_disp:.2f}"
+            # Summary stats — Johnson SU CDF in MODEL space; map actual to model space
+            if target_transform == "log_return":
+                actual_model_sel = float(np.log(actual_price_sel / anchor_sel))
             else:
-                pctile = float(stats_norm_cdf(actual_sel, mu_sel, sigma_sel) * 100)
-                dist_note = "Normal"
+                actual_model_sel = actual_price_sel
+            pctile = float(dist.cdf(actual_model_sel, mu_model_sel, sigma_sel, idx=idx) * 100)
+            _nu_disp = float(dist.nu[idx]) if isinstance(dist.nu, np.ndarray) else float(dist.nu)
+            _tau_disp = float(dist.tau[idx]) if isinstance(dist.tau, np.ndarray) else float(dist.tau)
+            dist_note = f"ν={_nu_disp:.2f}, τ={_tau_disp:.2f}"
             st.markdown(f"""
 | Metric | Value |
 |---|---|
-| Point forecast | ${mu_sel:.2f} |
-| Pred. σ | ${sigma_sel:.2f} |
-| Distribution | {dist_note} |
-| Actual price | ${actual_sel:.2f} |
+| Point forecast (price) | ${mu_price_sel:.2f} |
+| Pred. σ ({target_transform}) | {sigma_sel:.4f} |
+| Distribution | Johnson SU ({dist_note}) |
+| Actual price | ${actual_price_sel:.2f} |
 | Actual percentile | {pctile:.1f}th |
 """)
 
@@ -499,6 +642,12 @@ def main():
             "See how each feature influences the predicted oil price, "
             "holding all other features constant."
         )
+        if target_transform == "log_return":
+            st.caption(
+                "**Note**: y-axis is in **log-return** space (the model's training target). "
+                "A partial-dependence value of +0.01 means the feature shifts the predicted "
+                "log-return by 0.01, i.e. ≈ 1% change in next-day price."
+            )
         selected_feature = st.selectbox("Select Feature", options=feature_names, index=0)
         if selected_feature:
             feat_idx = feature_names.index(selected_feature)
@@ -519,13 +668,22 @@ def main():
             "Adjust a feature value and see how the predicted price and its "
             "**probability distribution** respond. The baseline is the most recent observation."
         )
+        if target_transform == "log_return":
+            st.caption(
+                "**Note**: the chart's y-axis is in log-return space.  Use the "
+                "metric below for the equivalent reconstructed price."
+            )
 
         base_X = X_latest.copy()
-        current_pred = gam.predict(base_X)[0]
+        current_pred_model = float(gam.predict(base_X)[0])
         current_sigma = float(_get_sigma_from_gam(gam, base_X, sigma_scale=sigma_scale)[0])
+        if target_transform == "log_return":
+            current_pred = last_close * float(np.exp(current_pred_model))
+        else:
+            current_pred = current_pred_model
 
         st.metric("Current Predicted Price", f"${current_pred:.2f}",
-                  help=f"σ = ${current_sigma:.2f}")
+                  help=f"σ ({target_transform}) = {current_sigma:.4f}")
 
         whatif_feature = st.selectbox(
             "Select Feature to Vary", options=feature_names,
@@ -564,12 +722,15 @@ def main():
 
             with col_density:
                 st.markdown("#### Predictive Density at Current Value")
+                from app.components import plot_predictive_density_price_space_plotly
                 st.plotly_chart(
-                    plot_predictive_density_plotly(
-                        mu=current_pred,
-                        sigma=current_sigma,
-                        title=f"Forecast Distribution\n({whatif_feature} = {current_val:.3f})",
+                    plot_predictive_density_price_space_plotly(
+                        mu_model=current_pred_model,
+                        sigma_model=current_sigma,
+                        anchor=last_close,
                         dist=dist,
+                        title=f"Forecast Distribution\n({whatif_feature} = {current_val:.3f})",
+                        target_transform=target_transform,
                     ),
                     use_container_width=True,
                 )
@@ -581,16 +742,19 @@ def main():
                 val = current_val * (1 + pct) if pct != 0.0 else current_val
                 X_s = base_X.copy()
                 X_s[0, feat_idx] = val
-                p = float(gam.predict(X_s)[0])
-                sig = float(_get_sigma_from_gam(gam, X_s, sigma_scale=sigma_scale)[0])
-                if dist is not None:
-                    lo95 = dist.ppf(0.025, p, sig)
-                    hi95 = dist.ppf(0.975, p, sig)
-                    pi_str = f"95% PI: ${lo95:.1f}–${hi95:.1f}"
+                p_model = float(gam.predict(X_s)[0])
+                sig_model = float(_get_sigma_from_gam(gam, X_s, sigma_scale=sigma_scale)[0])
+                if target_transform == "log_return":
+                    p_price = last_close * float(np.exp(p_model))
+                    lo95_price = last_close * float(np.exp(dist.ppf(0.025, p_model, sig_model)))
+                    hi95_price = last_close * float(np.exp(dist.ppf(0.975, p_model, sig_model)))
                 else:
-                    pi_str = f"σ=${sig:.2f}"
+                    p_price = p_model
+                    lo95_price = float(dist.ppf(0.025, p_model, sig_model))
+                    hi95_price = float(dist.ppf(0.975, p_model, sig_model))
+                pi_str = f"95% PI: ${lo95_price:.1f}–${hi95_price:.1f}"
                 label = f"{'+' if pct > 0 else ''}{int(pct*100)}%  ({val:.2f})" if pct != 0 else "Current"
-                col.metric(label, f"${p:.2f}", pi_str)
+                col.metric(label, f"${p_price:.2f}", pi_str)
 
     # ── Tab 6: Model Terms ────────────────────────────────────────────────────
     with tab6:
@@ -651,6 +815,98 @@ def main():
                 )
             except Exception as _e:
                 st.warning(f"Could not build {_param_key} terms table: {_e}")
+
+
+    # ── Tab 7: Backtest (walk-forward + drift) ────────────────────────────────
+    with tab7:
+        st.subheader("Walk-Forward Backtest — Production Simulation")
+        st.markdown(
+            "Cross-validation reports summary statistics suitable for hyperparameter "
+            "tuning, but does not simulate production: the model is never re-fit on a "
+            "sliding window.  This tab replays the entire history with periodic re-fits "
+            "and stitches a continuous out-of-sample forecast path.  All metrics here "
+            "are honest out-of-sample numbers."
+        )
+
+        bt_path = load_backtest_path(config)
+        col_a, col_b = st.columns([4, 1])
+        with col_b:
+            bt_show_days = st.slider(
+                "Days to show", min_value=60, max_value=2000, value=500, step=50,
+                key="bt_show_days",
+            )
+            run_now = st.button("Re-run backtest", help="Recomputes from scratch — slow")
+        if run_now:
+            with st.spinner("Running walk-forward backtest…"):
+                bt = run_walk_forward_backtest(config, df=df)
+                bt_path = bt.path
+                st.success(
+                    f"Backtest complete: {len(bt.path)} out-of-sample observations "
+                    f"across {bt.config_snapshot['n_refits']} refits."
+                )
+        if bt_path is None:
+            st.info(
+                "No saved backtest found.  Run `python scripts/run_pipeline.py` "
+                "(without `--skip-backtest`) or click **Re-run backtest** above."
+            )
+        else:
+            from app.components import plot_backtest_path, plot_rolling_mae_plotly
+            st.plotly_chart(
+                plot_backtest_path(bt_path, last_n_days=bt_show_days, show_pi_widths=(95,)),
+                use_container_width=True,
+            )
+
+            # Summary scores
+            scores_path = (Path(root) / "outputs" / "backtest_path.scores.json")
+            if scores_path.exists():
+                import json as _json
+                scores = _json.loads(scores_path.read_text())
+                cols = st.columns(4)
+                cols[0].metric("Walk-forward MAE",
+                               f"${scores.get('mae_price', float('nan')):.2f}")
+                cols[1].metric("RMSE skill vs naive",
+                               f"{scores.get('skill_rmse', 0) * 100:+.1f}%",
+                               help="Positive ⇒ GAM beats naive on RMSE")
+                cols[2].metric("Directional accuracy",
+                               f"{scores.get('directional_accuracy', float('nan')) * 100:.1f}%")
+                cov95 = scores.get('coverage_95_empirical', float('nan'))
+                cols[3].metric("Empirical 95% coverage",
+                               f"{cov95 * 100:.1f}%",
+                               help="Should be ≈ 95%; far from 95% ⇒ PI mis-calibrated")
+
+            # Concept-drift monitor (item 15)
+            st.markdown("---")
+            st.subheader("Concept-Drift Monitor")
+            st.markdown(
+                "Rolling 63-day MAE of the walk-forward path.  When the orange "
+                "threshold is exceeded for an extended period, consider an "
+                "off-cadence re-fit — performance may have deteriorated past "
+                "what the calendar-based refit window will catch."
+            )
+            st.plotly_chart(
+                plot_rolling_mae_plotly(bt_path, window=63),
+                use_container_width=True,
+            )
+
+            # Bates-Granger combination weight
+            st.markdown("---")
+            st.subheader("Bates-Granger Combination vs Naive")
+            w = load_combo_weights(config)
+            if w is None:
+                if st.button("Fit combination weight", key="fit_combo"):
+                    cw = fit_from_backtest(bt_path)
+                    from src.combination import save_weights as _save
+                    _save(cw, config)
+                    st.success(f"w_gam* = {cw.w_gam:.3f} → RMSE {cw.rmse_combo:.4f}")
+                    w = load_combo_weights(config)
+            if w is not None:
+                ccol1, ccol2, ccol3 = st.columns(3)
+                ccol1.metric("Optimal w (GAM)", f"{w['w_gam']:.3f}",
+                             help=f"1 − w on naive = {1.0 - w['w_gam']:.3f}")
+                ccol2.metric("Combo RMSE", f"${w['rmse_combo']:.2f}")
+                if w.get("skill_vs_gam") is not None:
+                    ccol3.metric("Skill vs GAM-alone",
+                                 f"{w['skill_vs_gam'] * 100:+.2f}%")
 
 
 # ── Helper imported inline to avoid circular deps ────────────────────────────

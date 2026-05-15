@@ -15,7 +15,14 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from src.config_loader import get_project_root
-from src.model import build_feature_matrix, load_feature_names, load_model
+from src.model import (
+    build_feature_matrix,
+    compute_anchor_prices,
+    get_target_y_level,
+    load_feature_names,
+    load_model,
+    reconstruct_price_from_returns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +295,213 @@ def compare_with_baseline(
         ]
     )
     return comparison.set_index("Model")
+
+
+# ─────────────────────────────────────────────
+# Item 13: probabilistic scoring metrics
+# ─────────────────────────────────────────────
+
+def directional_accuracy(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_anchor: np.ndarray,
+) -> float:
+    """Fraction of forecasts whose directional sign matches the realised move.
+
+    Compares ``sign(y_pred - y_anchor)`` with ``sign(y_true - y_anchor)`` where
+    *y_anchor* is the previous trading day's close.  A naive forecast (tomorrow
+    = today) has zero directional information; a GAM with directional accuracy
+    > 0.5 has trading value even if its MAE is similar to the naive baseline.
+    Ties (zero change) are counted as misses.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    y_anchor = np.asarray(y_anchor)
+    mask = ~(np.isnan(y_true) | np.isnan(y_pred) | np.isnan(y_anchor))
+    if not mask.any():
+        return float("nan")
+    pred_sign = np.sign(y_pred[mask] - y_anchor[mask])
+    true_sign = np.sign(y_true[mask] - y_anchor[mask])
+    return float(np.mean(pred_sign == true_sign))
+
+
+def pinball_loss(
+    y_true: np.ndarray,
+    y_pred_quantile: np.ndarray,
+    q: float,
+) -> float:
+    """Pinball (quantile) loss at level *q*.
+
+    The proper scoring rule for quantile forecasts: minimised in expectation
+    by reporting the true ``q``-quantile.  Use to evaluate ExpectileGAM /
+    quantile-regression PIs at multiple levels.
+    """
+    diff = np.asarray(y_true) - np.asarray(y_pred_quantile)
+    return float(np.mean(np.maximum(q * diff, (q - 1.0) * diff)))
+
+
+def crps_via_samples(
+    y_true: np.ndarray,
+    samples: np.ndarray,
+) -> np.ndarray:
+    """Per-observation CRPS estimated from a sample matrix.
+
+    *samples* has shape ``(n_obs, n_draws)``.  CRPS is computed via the
+    expectation form
+
+        ``CRPS_i = E|X − y_i| − ½ E|X − X'|``
+
+    using ``X, X'`` as two independent halves of the sample matrix.
+    Returns one scalar per observation.
+    """
+    samples = np.asarray(samples)
+    y_true = np.asarray(y_true).reshape(-1, 1)
+    n_draws = samples.shape[1]
+    half = n_draws // 2
+    if half < 2:
+        raise ValueError("crps_via_samples needs at least 4 samples per observation")
+    s1 = samples[:, :half]
+    s2 = samples[:, half: 2 * half]
+    return np.mean(np.abs(s1 - y_true), axis=1) - 0.5 * np.mean(np.abs(s1 - s2), axis=1)
+
+
+def crps_johnsonsu(
+    y_true: np.ndarray,
+    y_pred_mu: np.ndarray,
+    sigma: np.ndarray,
+    dist: "PredictiveDistribution",
+    n_samples: int = 500,
+    random_state: int = 0,
+) -> np.ndarray:
+    """Per-observation CRPS for Johnson SU predictive distributions via MC.
+
+    Generates *n_samples* draws from each row's Johnson SU and feeds them to
+    :func:`crps_via_samples`.  Returns one CRPS value per observation.
+    """
+    n = len(y_true)
+    rng = np.random.default_rng(random_state)
+    samples = np.empty((n, n_samples))
+    for i in range(n):
+        a, b, loc, scale = dist._params(float(y_pred_mu[i]), float(sigma[i]), idx=i)
+        samples[i, :] = stats.johnsonsu.rvs(
+            a, b, loc=loc, scale=scale, size=n_samples, random_state=rng
+        )
+    return crps_via_samples(y_true, samples)
+
+
+def log_score_johnsonsu(
+    y_true: np.ndarray,
+    y_pred_mu: np.ndarray,
+    sigma: np.ndarray,
+    dist: "PredictiveDistribution",
+) -> np.ndarray:
+    """Negative log predictive density (log-score) for Johnson SU.
+
+    Lower is better.  The log-score is a strictly proper scoring rule.
+    Returns one score per observation.
+    """
+    n = len(y_true)
+    out = np.empty(n)
+    for i in range(n):
+        a, b, loc, scale = dist._params(float(y_pred_mu[i]), float(sigma[i]), idx=i)
+        out[i] = -stats.johnsonsu.logpdf(float(y_true[i]), a, b, loc=loc, scale=scale)
+    return out
+
+
+def compute_pit(
+    y_true: np.ndarray,
+    y_pred_mu: np.ndarray,
+    sigma: np.ndarray,
+    dist: "PredictiveDistribution",
+) -> np.ndarray:
+    """Probability Integral Transform values ``F_i(y_i)`` per observation.
+
+    Under correct calibration the PIT values are i.i.d. Uniform(0, 1); a
+    histogram with consistent height ≈ 1 indicates a well-calibrated forecast.
+    U-shaped → too-narrow PIs; bell-shaped → too-wide PIs; skewed → mean bias.
+    """
+    return np.array([
+        dist.cdf(float(y_true[i]), float(y_pred_mu[i]), float(sigma[i]), idx=i)
+        for i in range(len(y_true))
+    ])
+
+
+def empirical_coverage(
+    y_true: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> float:
+    """Fraction of observations falling inside ``[lower, upper]``."""
+    return float(np.mean((y_true >= lower) & (y_true <= upper)))
+
+
+def plot_pit_histogram(
+    pit: np.ndarray,
+    n_bins: int = 20,
+    save_path: str | Path = "outputs/figures/pit_histogram.png",
+) -> None:
+    """Plot the PIT histogram with the Uniform(0,1) reference line.
+
+    Used for forecast calibration diagnostics.  Bars consistently above 1.0
+    in any bin signal that the predictive distribution puts too little mass
+    on that quantile; bars below 1.0 signal too much mass.
+    """
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.hist(
+        pit, bins=n_bins, range=(0, 1), density=True,
+        color="#6baed6", edgecolor="black", linewidth=0.3,
+    )
+    ax.axhline(1.0, color="crimson", linestyle="--", linewidth=1.2,
+               label="Uniform(0, 1) reference")
+    ax.set_xlabel("PIT value  F(y)")
+    ax.set_ylabel("Density")
+    ax.set_title("PIT Histogram — calibration diagnostic\n"
+                 "(flat ⇒ calibrated; U-shape ⇒ too narrow; bell ⇒ too wide)")
+    ax.set_ylim(0, max(2.0, ax.get_ylim()[1]))
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved PIT histogram to {save_path}")
+
+
+def compute_probabilistic_scores(
+    y_true: np.ndarray,
+    y_pred_mu: np.ndarray,
+    sigma: np.ndarray,
+    dist: "PredictiveDistribution",
+    y_anchor: np.ndarray | None = None,
+    quantile_levels: tuple[float, ...] = (0.05, 0.10, 0.50, 0.90, 0.95),
+    n_crps_samples: int = 500,
+) -> dict[str, float]:
+    """Bundle of probabilistic-forecast scores summarising distributional skill.
+
+    Returns a dict with:
+        crps_mean, log_score_mean,
+        pinball_q05 / q10 / q50 / q90 / q95,
+        coverage_50 / 80 / 90 / 95,
+        directional_accuracy (only when *y_anchor* provided),
+        pit_uniformity_pvalue (Kolmogorov–Smirnov against Uniform).
+    """
+    out: dict[str, float] = {}
+    crps = crps_johnsonsu(y_true, y_pred_mu, sigma, dist, n_samples=n_crps_samples)
+    out["crps_mean"] = float(np.mean(crps))
+    out["log_score_mean"] = float(np.mean(log_score_johnsonsu(y_true, y_pred_mu, sigma, dist)))
+    for q in quantile_levels:
+        q_pred = dist.ppf_array(q, y_pred_mu, sigma)
+        out[f"pinball_q{int(q * 100):02d}"] = pinball_loss(y_true, q_pred, q)
+    for w in (0.50, 0.80, 0.90, 0.95):
+        lo = dist.ppf_array((1 - w) / 2, y_pred_mu, sigma)
+        hi = dist.ppf_array((1 + w) / 2, y_pred_mu, sigma)
+        out[f"coverage_{int(w * 100)}"] = empirical_coverage(y_true, lo, hi)
+    if y_anchor is not None:
+        out["directional_accuracy"] = directional_accuracy(y_true, y_pred_mu, y_anchor)
+    pit = compute_pit(y_true, y_pred_mu, sigma, dist)
+    ks_stat, ks_p = stats.kstest(pit, "uniform")
+    out["pit_uniformity_pvalue"] = float(ks_p)
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -744,13 +958,17 @@ def print_gam_statistics(gam) -> None:
         f"  GCV score       : {stats_dict.get('GCV', float('nan')):.6f}",
         f"  AIC             : {stats_dict.get('AIC', float('nan')):.4f}",
         f"  AICc            : {stats_dict.get('AICc', float('nan')):.4f}",
-        f"  Pseudo R²       : {stats_dict.get('pseudo_r2', {}).get('explained_deviance', float('nan')):.4f}",
-        f"  Scale (σ²)      : {stats_dict.get('scale', float('nan')):.4f}",
+        f"  Pseudo R^2      : {stats_dict.get('pseudo_r2', {}).get('explained_deviance', float('nan')):.4f}",
+        f"  Scale (sigma^2) : {stats_dict.get('scale', float('nan')):.4f}",
         f"  N (observations): {stats_dict.get('n_samples', 'N/A')}",
         "",
     ]
     output = "\n".join(lines)
-    print(output)
+    # Use safe encoding for Windows cp1252 console
+    try:
+        print(output)
+    except UnicodeEncodeError:
+        print(output.encode("ascii", errors="replace").decode("ascii"))
     logger.info(output)
 
 
@@ -856,18 +1074,30 @@ def plot_gam_term_diagnostics(
 # ─────────────────────────────────────────────
 
 def run_evaluation(config: dict) -> pd.DataFrame:
-    """Run full evaluation: metrics, diagnostics, fan chart, density plot."""
+    """Run full evaluation: metrics, diagnostics, fan chart, density plot.
+
+    Honours ``features.target_transform``: when "log_return" the model's
+    predictions are in log-return space, but all reported metrics, fan-chart
+    bands, and probability forecasts are reconstructed back to **price level**
+    (USD/bbl) so the output is comparable across modes and intuitive to read.
+    """
+    import joblib  # local: only needed for transformer load
     root = get_project_root(config)
     fig_dir = root / "outputs" / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+    feat_cfg = config.get("features", {})
+    target = feat_cfg["target"]
+    target_transform = feat_cfg.get("target_transform", "level")
+
     df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
-    target = config["features"]["target"]
     gam = load_model(root / "outputs" / "models" / "gam_model.pkl")
 
     # Build the full feature matrix, then restrict to the columns the model
     # was actually trained on (stepwise selection may have dropped features).
-    X_full, y, all_feature_names, target_dates = build_feature_matrix(df, target)
+    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+        df, target, target_transform=target_transform,
+    )
     saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
     feature_names = (
         load_feature_names(saved_names_path)
@@ -885,12 +1115,35 @@ def run_evaluation(config: dict) -> pd.DataFrame:
         )
     X = X_full[:, col_idx]
 
-    y_gam = gam.predict(X)
-    y_naive = naive_baseline_predictions(y)
-    residuals = y - y_gam
+    # Apply saved skewed-feature transformer (if model was trained with it)
+    transformer_path = root / "outputs" / "models" / "feature_transformer.pkl"
+    if transformer_path.exists():
+        transformer = joblib.load(transformer_path)
+        X = transformer.transform(X)
+        logger.info("Applied saved SkewedFeatureTransformer to evaluation features.")
 
-    # ── Metrics comparison ────────────────────────────────────────────────────
-    comparison = compare_with_baseline(y, y_gam, y_naive)
+    # Anchor price (P_t) for reconstruction in log-return mode
+    anchor = compute_anchor_prices(df, target, forecast_horizon=1)
+    y_level = get_target_y_level(df, target, forecast_horizon=1)
+
+    # Model predictions in transform space
+    y_pred_model = gam.predict(X)
+    if target_transform == "log_return":
+        y_pred_level = reconstruct_price_from_returns(y_pred_model, anchor)
+    else:
+        y_pred_level = y_pred_model
+
+    # Naive baseline always in price-level space
+    y_naive_level = naive_baseline_predictions(y_level)
+    residuals_level = y_level - y_pred_level
+    residuals_model = y_model - y_pred_model
+
+    # ── Metrics comparison (price-scale) ──────────────────────────────────────
+    comparison = compare_with_baseline(y_level, y_pred_level, y_naive_level)
+    # Add directional accuracy row for both
+    dir_gam = directional_accuracy(y_level, y_pred_level, anchor)
+    dir_naive = directional_accuracy(y_level, y_naive_level, anchor)
+    comparison["directional_accuracy"] = [dir_gam, dir_naive]
     logger.info(f"\nModel Comparison:\n{comparison.to_string()}")
     print("\n=== Model Comparison ===")
     print(comparison.to_string())
@@ -899,44 +1152,96 @@ def run_evaluation(config: dict) -> pd.DataFrame:
     # ── GAM model-level statistics ────────────────────────────────────────────
     print_gam_statistics(gam)
 
-    # ── Standard plots ────────────────────────────────────────────────────────
-    plot_actual_vs_predicted(target_dates, y, y_gam, fig_dir / "actual_vs_pred.png")
-    plot_residual_diagnostics(y, y_gam, fig_dir / "residuals.png")
+    # ── Standard plots (price-scale) ──────────────────────────────────────────
+    plot_actual_vs_predicted(target_dates, y_level, y_pred_level,
+                             fig_dir / "actual_vs_pred.png")
+    plot_residual_diagnostics(y_level, y_pred_level, fig_dir / "residuals.png")
 
-    # ── Fit 4-parameter Johnson SU predictive distribution ───────────────────
-    sigma = get_prediction_sigma(gam, X)
-    dist = fit_residual_distribution(y, y_gam, sigma)
-    logger.info(f"Predictive distribution: {dist.describe()}")
+    # ── Fit Johnson SU predictive distribution in MODEL SPACE ────────────────
+    # (so σ heteroscedasticity is fitted on the actual loss residuals)
+    sigma_model = get_prediction_sigma(gam, X)
+    dist_model = fit_residual_distribution(y_model, y_pred_model, sigma_model)
+    logger.info(f"Predictive distribution (model space): {dist_model.describe()}")
+
+    # ── Probabilistic scores (model space; CRPS is unit-equivariant under
+    #     monotonic transform, log-score / coverage are also computed here) ───
+    prob_scores = compute_probabilistic_scores(
+        y_true=y_model,
+        y_pred_mu=y_pred_model,
+        sigma=sigma_model,
+        dist=dist_model,
+        y_anchor=np.zeros_like(y_model) if target_transform == "log_return" else anchor,
+    )
+    logger.info("Probabilistic scores: " +
+                ", ".join(f"{k}={v:.4f}" for k, v in prob_scores.items()))
+    print("\n=== Probabilistic Scores ===")
+    for k, v in prob_scores.items():
+        print(f"  {k:30s} {v:>10.4f}")
+    print()
+
+    # PIT histogram for calibration diagnostics
+    pit = compute_pit(y_model, y_pred_model, sigma_model, dist_model)
+    plot_pit_histogram(pit, save_path=fig_dir / "pit_histogram.png")
 
     # ── Probability forecast plots ────────────────────────────────────────────
-    # Fan chart (last 500 trading days) — Johnson SU bands
-    plot_fan_chart(target_dates, y, y_gam, gam, X,
-                   save_path=fig_dir / "fan_chart.png",
-                   dist=dist)
+    # Fan chart in price space: convert each quantile band from return space
+    # back to price using the row-aligned anchor.
+    if target_transform == "log_return":
+        # Build per-quantile lower/upper in price space
+        widths = CI_LEVELS
+        intervals_price = {}
+        for w in widths:
+            q_lo = (1 - w) / 2
+            q_hi = (1 + w) / 2
+            r_lo = dist_model.ppf_array(q_lo, y_pred_model, sigma_model)
+            r_hi = dist_model.ppf_array(q_hi, y_pred_model, sigma_model)
+            intervals_price[w] = np.column_stack([
+                anchor * np.exp(r_lo),
+                anchor * np.exp(r_hi),
+            ])
+        _plot_fan_chart_from_intervals(
+            target_dates, y_level, y_pred_level, intervals_price,
+            save_path=fig_dir / "fan_chart.png",
+            title="Crude Oil Forecast Fan Chart — Johnson SU on log-returns "
+                  "(reconstructed to price)",
+        )
+    else:
+        plot_fan_chart(target_dates, y_level, y_pred_level, gam, X,
+                       save_path=fig_dir / "fan_chart.png",
+                       dist=dist_model)
 
     # Genuine T+1 forecast: predict tomorrow using today's (last available) features
-    X_full_0, _, _, _ = build_feature_matrix(df, target, forecast_horizon=0)
+    X_full_0, _, _, _ = build_feature_matrix(
+        df, target, forecast_horizon=0, target_transform=target_transform,
+    )
     X_latest = X_full_0[-1:, col_idx]
-    mu_tomorrow = float(gam.predict(X_latest)[0])
-    sigma_tomorrow = float(get_prediction_sigma(gam, X_latest)[0])
+    if transformer_path.exists():
+        X_latest = transformer.transform(X_latest)
+    mu_tomorrow_model = float(gam.predict(X_latest)[0])
+    sigma_tomorrow_model = float(get_prediction_sigma(gam, X_latest)[0])
+    last_close = float(df[target].iloc[-1])
     tomorrow_date = df.index[-1] + pd.offsets.BDay(1)
+    if target_transform == "log_return":
+        mu_tomorrow_price = last_close * np.exp(mu_tomorrow_model)
+        # Approximate price-space sigma via the delta method: σ_p ≈ P · σ_r
+        sigma_tomorrow_price = last_close * sigma_tomorrow_model
+    else:
+        mu_tomorrow_price = mu_tomorrow_model
+        sigma_tomorrow_price = sigma_tomorrow_model
 
     plot_predictive_density(
-        mu=mu_tomorrow,
-        sigma=sigma_tomorrow,
-        y_actual=None,   # outcome is unknown; no red marker drawn
+        mu=mu_tomorrow_price,
+        sigma=sigma_tomorrow_price,
+        y_actual=None,
         save_path=fig_dir / "predictive_density.png",
         title=f"Predictive Distribution — {tomorrow_date.date()}",
-        dist=dist,
+        dist=dist_model if target_transform != "log_return" else None,
     )
 
-    # ── Advanced residual diagnostics ─────────────────────────────────────────
-    # Ljung-Box white-noise test (table printed via logger inside function)
-    lb_results = test_residual_white_noise(residuals, lags=40)
-    plot_ljung_box(residuals, lags=40, save_path=fig_dir / "ljung_box.png")
-
-    # ACF / PACF of residuals
-    plot_residual_acf_pacf(residuals, lags=60,
+    # ── Advanced residual diagnostics on model-space residuals ───────────────
+    lb_results = test_residual_white_noise(residuals_model, lags=40)
+    plot_ljung_box(residuals_model, lags=40, save_path=fig_dir / "ljung_box.png")
+    plot_residual_acf_pacf(residuals_model, lags=60,
                            save_path=fig_dir / "residual_acf_pacf.png")
 
     # ── GAM term-level diagnostics ────────────────────────────────────────────
@@ -944,3 +1249,51 @@ def run_evaluation(config: dict) -> pd.DataFrame:
                               save_path=fig_dir / "gam_term_diagnostics.png")
 
     return comparison
+
+
+def _plot_fan_chart_from_intervals(
+    dates: pd.DatetimeIndex,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    intervals: dict[float, np.ndarray],
+    save_path: str | Path,
+    last_n_days: int = 500,
+    title: str = "Crude Oil Forecast Fan Chart",
+) -> None:
+    """Variant of :func:`plot_fan_chart` that takes pre-computed intervals.
+
+    Used when the intervals are constructed in price space from a model that
+    was actually fitted on a transformed target (e.g. log-returns reconstructed
+    to USD/bbl).
+    """
+    n = min(last_n_days, len(dates))
+    dates_n = dates[-n:]
+    y_true_n = y_true[-n:]
+    y_pred_n = y_pred[-n:]
+    widths = sorted(intervals.keys(), reverse=True)
+
+    fig, ax = plt.subplots(figsize=(16, 7))
+    for width, color, alpha in zip(
+        widths,
+        list(reversed(CI_COLORS_MPL[: len(widths)])),
+        list(reversed(CI_ALPHAS_MPL[: len(widths)])),
+    ):
+        band = intervals[width][-n:]
+        ax.fill_between(dates_n, band[:, 0], band[:, 1],
+                        color=color, alpha=alpha,
+                        label=f"{int(width * 100)}% PI")
+
+    ax.plot(dates_n, y_pred_n, color="#08306b", linewidth=1.2,
+            label="Point forecast", zorder=4)
+    ax.plot(dates_n, y_true_n, color="black", linewidth=0.8,
+            linestyle="--", alpha=0.7, label="Actual", zorder=5)
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price (USD)")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved fan chart to {save_path}")

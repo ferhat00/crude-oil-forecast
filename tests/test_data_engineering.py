@@ -8,6 +8,7 @@ from src.data_engineering import (
     add_atr_features,
     add_calendar_features,
     add_cmf,
+    add_inventory_change_features,
     add_lag_features,
     add_momentum_features,
     add_momentum_windows,
@@ -16,6 +17,7 @@ from src.data_engineering import (
     add_rolling_features,
     add_seasonal_flags,
     add_stochastic,
+    add_term_structure_features,
     add_williams_r,
     merge_datasets,
 )
@@ -142,9 +144,29 @@ class TestMergeDatasets:
         assert "usd_index" in merged.columns
         assert "crude_stocks" in merged.columns
 
-    def test_merge_no_nans(self, sample_oil_df, sample_fred_df, sample_eia_dfs):
+    def test_merge_no_nans_in_oil_columns(
+        self, sample_oil_df, sample_fred_df, sample_eia_dfs,
+    ):
+        """The oil columns must never have NaN after merge — the rest are
+        allowed an unavoidable warm-up window when slow-released sources
+        start later than the oil series.
+        """
+        merged = merge_datasets(
+            sample_oil_df, sample_fred_df, sample_eia_dfs,
+            publication_lags={},
+        )
+        assert not merged[sample_oil_df.columns].isna().any().any()
+
+    def test_publication_lag_shifts_eia(self, sample_oil_df, sample_fred_df, sample_eia_dfs):
+        """EIA values are shifted forward by 5 calendar days (publication date)."""
+        # With the default lag, the EIA value originally indexed at 2023-01-06
+        # appears in the merged frame from 2023-01-11 onward (Wed release for
+        # week ending the prior Friday).
         merged = merge_datasets(sample_oil_df, sample_fred_df, sample_eia_dfs)
-        assert not merged.isna().any().any()
+        original_jan6 = sample_eia_dfs["crude_stocks"].iloc[0, 0]
+        # Pre-publication days should be NaN, then ffilled to original_jan6
+        post_release = merged.loc["2023-01-11":, "crude_stocks"]
+        assert post_release.iloc[0] == original_jan6
 
     def test_merge_includes_cot_columns(
         self, sample_oil_df, sample_fred_df, sample_eia_dfs, sample_cot_df
@@ -542,6 +564,59 @@ class TestSeasonalFlags:
             {"driving_season": False, "heating_season": False, "us_holidays": False},
         )
         assert set(result.columns) == before_cols
+
+
+class TestTermStructure:
+    def test_creates_spread_columns(self):
+        dates = pd.date_range("2023-01-02", periods=60, freq="B")
+        rng = np.random.default_rng(42)
+        m1 = 70 + rng.standard_normal(60).cumsum()
+        m2 = m1 + rng.standard_normal(60) * 0.5  # mostly close to m1
+        m3 = m2 + rng.standard_normal(60) * 0.5
+        df = pd.DataFrame({"wti_m1": m1, "wti_m2": m2, "wti_m3": m3}, index=dates)
+        out = add_term_structure_features(df.copy())
+        assert "wti_m1_m2_spread" in out.columns
+        assert "wti_m1_m2_pct" in out.columns
+        assert "contango_flag" in out.columns
+        assert "wti_m1_m3_spread" in out.columns
+
+    def test_contango_flag_binary(self):
+        dates = pd.date_range("2023-01-02", periods=20, freq="B")
+        df = pd.DataFrame({
+            "wti_m1": [70.0] * 20,
+            "wti_m2": [71.0] * 10 + [69.0] * 10,  # contango then backwardation
+        }, index=dates)
+        out = add_term_structure_features(df.copy())
+        # First 10 rows: m1 < m2 → contango_flag = 1
+        assert (out["contango_flag"].iloc[:10] == 1).all()
+        # Next 10: m1 > m2 → contango_flag = 0
+        assert (out["contango_flag"].iloc[10:] == 0).all()
+
+    def test_skipped_when_columns_missing(self, sample_oil_df):
+        out = add_term_structure_features(sample_oil_df.copy())
+        # No m1/m2 in fixture → no new columns
+        assert "wti_m1_m2_spread" not in out.columns
+
+
+class TestInventoryChange:
+    def test_creates_chg_columns(self):
+        dates = pd.date_range("2023-01-02", periods=30, freq="B")
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({
+            "crude_stocks": 400_000 + rng.standard_normal(30).cumsum() * 1000,
+            "production": 12_000 + rng.standard_normal(30) * 50,
+        }, index=dates)
+        out = add_inventory_change_features(df.copy(), eia_cols=["crude_stocks", "production"])
+        assert "crude_stocks_chg" in out.columns
+        assert "crude_stocks_chg_pct" in out.columns
+        assert "production_chg" in out.columns
+
+    def test_missing_cols_skipped(self):
+        dates = pd.date_range("2023-01-02", periods=10, freq="B")
+        df = pd.DataFrame({"crude_stocks": [400_000] * 10}, index=dates)
+        out = add_inventory_change_features(df.copy(), eia_cols=["crude_stocks", "nonexistent"])
+        assert "crude_stocks_chg" in out.columns
+        assert "nonexistent_chg" not in out.columns
 
 
 class TestTargetForwardShift:

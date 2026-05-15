@@ -16,6 +16,41 @@ logger = logging.getLogger(__name__)
 # Merging
 # ─────────────────────────────────────────────
 
+# Publication-availability lags (calendar days) for slow-released sources.
+# A series whose period_end is Friday but is only published on the following
+# Wednesday must be shifted forward by 5 calendar days before forward-filling
+# into a daily index, otherwise the model on Tuesday already "sees" Friday's
+# value — a small but real look-ahead bias that EmbargoedTimeSeriesSplit does
+# not catch (it operates on positions in the index, not on publication time).
+#
+# Sources:
+#   - EIA Weekly Petroleum Status Report: data for week ending Fri, released
+#     the following Wednesday ~10:30am ET → +5 calendar days.
+#   - CFTC COT Disaggregated Futures: positions as of Tuesday, released Friday
+#     after market close → +3 calendar days.
+#   - Alpha Vantage monthly macro releases: typical publication lag of ~30 days
+#     after the reference month-end.
+PUBLICATION_LAG_DAYS = {
+    "eia": 5,
+    "cot": 3,
+    "alpha_vantage": 30,
+}
+
+
+def _shift_publication_lag(df: pd.DataFrame, lag_days: int) -> pd.DataFrame:
+    """Return *df* with its DatetimeIndex shifted forward by *lag_days*.
+
+    The shifted DataFrame represents *publication-available-date* indexing:
+    a value originally indexed by its reference period-end is moved to the
+    earliest date a model could legitimately know about it.
+    """
+    if lag_days <= 0 or df is None or df.empty:
+        return df
+    shifted = df.copy()
+    shifted.index = shifted.index + pd.Timedelta(days=lag_days)
+    return shifted
+
+
 def merge_datasets(
     oil_df: pd.DataFrame,
     fred_df: pd.DataFrame,
@@ -23,33 +58,50 @@ def merge_datasets(
     market_df: pd.DataFrame | None = None,
     cot_df: pd.DataFrame | None = None,
     alpha_vantage_df: pd.DataFrame | None = None,
+    publication_lags: dict[str, int] | None = None,
 ) -> pd.DataFrame:
-    """Merge all data sources on date index.
+    """Merge all data sources on date index, accounting for publication lag.
 
-    EIA, COT, and Alpha Vantage data (weekly/monthly) are resampled to daily
-    via forward-fill before merging. All DataFrames are left-joined on the oil
-    price base index, then forward-filled to handle weekends/holidays.
+    EIA, COT, and Alpha Vantage data (weekly/monthly) are first **shifted
+    forward by their real publication lag** (so e.g. an EIA series for the
+    week ending Friday is only visible from the following Wednesday onward),
+    then resampled to daily via forward-fill before merging.  All DataFrames
+    are left-joined on the oil price base index, then forward-filled to
+    handle weekends/holidays.
 
     Args:
         oil_df: Daily oil OHLCV data (WTI + Brent).
-        fred_df: Daily/irregular FRED macro data.
+        fred_df: Daily/irregular FRED macro data.  FRED already publishes by
+            release-date (its index is the data's reference date but daily
+            macro series like DTWEXBGS are released same-day) so no extra
+            shift is applied here.  Mixed-frequency FRED series may still
+            have small look-ahead but the effect is dominated by EIA/COT.
         eia_dfs: Dict of EIA DataFrames with weekly/monthly frequency.
         market_df: Optional DataFrame of broad market close prices.
         cot_df: Optional weekly CFTC COT positioning DataFrame.
         alpha_vantage_df: Optional monthly Alpha Vantage economic indicators.
+        publication_lags: Optional override for default publication lags
+            in :data:`PUBLICATION_LAG_DAYS`.  Pass an empty dict to disable
+            shifting entirely (useful for tests).
 
     Returns:
         Merged DataFrame with daily frequency and no gaps in the oil series.
     """
+    # Only fall back to defaults when publication_lags is None (not when empty
+    # dict — passing {} explicitly disables shifting, which tests rely on).
+    lags = PUBLICATION_LAG_DAYS if publication_lags is None else dict(publication_lags)
+
     # Start with oil prices as the base (daily trading days)
     merged = oil_df.copy()
 
     # Join FRED data (left join — FRED may have gaps on weekends)
     merged = merged.join(fred_df, how="left")
 
-    # Resample EIA data to daily and join
+    # Resample EIA data to daily and join (shift to publication date first)
+    eia_lag = int(lags.get("eia", 0))
     for name, eia_df in eia_dfs.items():
         eia_renamed = eia_df.rename(columns={"value": name})
+        eia_renamed = _shift_publication_lag(eia_renamed, eia_lag)
         eia_daily = eia_renamed.resample("D").ffill()
         merged = merged.join(eia_daily, how="left")
 
@@ -57,14 +109,18 @@ def merge_datasets(
     if market_df is not None and not market_df.empty:
         merged = merged.join(market_df, how="left")
 
-    # COT positioning data (weekly → resample to daily via ffill)
+    # COT positioning data (weekly → shift to release date, resample to daily)
     if cot_df is not None and not cot_df.empty:
-        cot_daily = cot_df.resample("D").ffill()
+        cot_shifted = _shift_publication_lag(cot_df, int(lags.get("cot", 0)))
+        cot_daily = cot_shifted.resample("D").ffill()
         merged = merged.join(cot_daily, how="left")
 
-    # Alpha Vantage economic indicators (monthly → resample to daily via ffill)
+    # Alpha Vantage economic indicators (monthly → release-date shift)
     if alpha_vantage_df is not None and not alpha_vantage_df.empty:
-        av_daily = alpha_vantage_df.resample("D").ffill()
+        av_shifted = _shift_publication_lag(
+            alpha_vantage_df, int(lags.get("alpha_vantage", 0))
+        )
+        av_daily = av_shifted.resample("D").ffill()
         merged = merged.join(av_daily, how="left")
 
     # Forward-fill remaining NaN from weekends / different trading calendars
@@ -73,7 +129,10 @@ def merge_datasets(
     # Drop rows where core oil data is still missing
     merged = merged.dropna(subset=oil_df.columns.tolist())
 
-    logger.info(f"Merged dataset: {merged.shape[0]} rows, {merged.shape[1]} columns")
+    logger.info(
+        f"Merged dataset: {merged.shape[0]} rows, {merged.shape[1]} columns "
+        f"(publication lags applied: {lags})"
+    )
     return merged
 
 
@@ -390,6 +449,83 @@ def add_crack_spread_features(
         df["crack_3_2_1_sma_14"] = df["crack_3_2_1"].rolling(14, min_periods=14).mean()
         logger.info("Computed gasoline, heating-oil, and 3-2-1 crack spreads")
 
+    return df
+
+
+def add_term_structure_features(
+    df: pd.DataFrame,
+    m1_col: str = "wti_m1",
+    m2_col: str = "wti_m2",
+    m3_col: str | None = "wti_m3",
+    m4_col: str | None = "wti_m4",
+) -> pd.DataFrame:
+    """Add NYMEX WTI futures term-structure features (contango / backwardation).
+
+    The shape of the futures curve is the most-cited single fundamental signal
+    in crude oil pricing.  When the front month trades below deferred contracts
+    (``m1 < m2``) the market is in **contango** — typically signalling oversupply
+    or storage stress.  When ``m1 > m2`` the market is in **backwardation** —
+    typically signalling tight prompt supply.
+
+    Features generated:
+
+    * ``wti_m1_m2_spread`` — front minus 1-month deferred ($/bbl); positive ⇒
+      backwardation.
+    * ``wti_m1_m2_pct`` — same spread normalised by front-month price.
+    * ``wti_m1_m3_spread`` — 2-month deferred spread (when ``m3_col`` provided).
+    * ``wti_m1_m4_spread`` — 3-month deferred spread (when ``m4_col`` provided).
+    * ``contango_flag`` — binary 1/0 indicator (1 = contango).
+    * ``wti_m1_m2_spread_sma_14`` — 14-day SMA of the front spread.
+    * ``wti_m1_m2_spread_std_14`` — 14-day rolling std (curve volatility).
+    * ``wti_m1_m2_spread_chg`` — 1-day change in the spread (curve dynamics).
+    """
+    if m1_col not in df.columns or m2_col not in df.columns:
+        logger.warning(
+            f"Term-structure features skipped: '{m1_col}' or '{m2_col}' not in columns."
+        )
+        return df
+
+    spread = df[m1_col] - df[m2_col]
+    df["wti_m1_m2_spread"] = spread
+    df["wti_m1_m2_pct"] = spread / df[m1_col].replace(0, np.nan)
+    df["contango_flag"] = (spread < 0).astype(int)
+    df["wti_m1_m2_spread_sma_14"] = spread.rolling(14, min_periods=14).mean()
+    df["wti_m1_m2_spread_std_14"] = spread.rolling(14, min_periods=14).std()
+    df["wti_m1_m2_spread_chg"] = spread.diff()
+
+    if m3_col and m3_col in df.columns:
+        df["wti_m1_m3_spread"] = df[m1_col] - df[m3_col]
+    if m4_col and m4_col in df.columns:
+        df["wti_m1_m4_spread"] = df[m1_col] - df[m4_col]
+
+    logger.info("Added WTI term-structure features (contango/backwardation).")
+    return df
+
+
+def add_inventory_change_features(
+    df: pd.DataFrame,
+    eia_cols: list[str] | None = None,
+    weekly_lag: int = 7,
+) -> pd.DataFrame:
+    """Add week-on-week change in EIA inventory series.
+
+    The original EIA series are forward-filled to daily after the publication-
+    lag shift (see :func:`merge_datasets`), so ``diff(weekly_lag)`` recovers
+    the genuine weekly change as a step-function that updates once per release.
+    Captured as both an absolute change and a percentage of the prior level.
+    """
+    if eia_cols is None:
+        eia_cols = [
+            "crude_stocks", "cushing_stocks", "gasoline_stocks", "distillate_stocks",
+            "spr", "production", "crude_imports", "crude_exports",
+            "refinery_utilization",
+        ]
+    for col in eia_cols:
+        if col not in df.columns:
+            continue
+        df[f"{col}_chg"] = df[col].diff(weekly_lag)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df[f"{col}_chg_pct"] = df[f"{col}_chg"] / df[col].shift(weekly_lag).replace(0, np.nan)
     return df
 
 
@@ -910,6 +1046,12 @@ def build_features(config: dict) -> pd.DataFrame:
     # 11. Crack spreads (refinery margin proxies for crude demand)
     if wti_col:
         df = add_crack_spread_features(df, wti_col, gasoline_col, heating_oil_col)
+
+    # 12. WTI futures term structure (contango / backwardation)
+    df = add_term_structure_features(df)
+
+    # 13. EIA inventory week-on-week changes (used by interaction whitelist)
+    df = add_inventory_change_features(df)
 
     # ── Drop warm-up NaN rows ─────────────────────────
     before = len(df)

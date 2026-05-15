@@ -25,6 +25,18 @@ _MODEL_DEFAULTS: dict = {
     "nu_tau_window": 60,
     "nu_max_terms": 8,
     "tau_max_terms": 8,
+    # Forecast-quality knobs (see plan items 6, 8, 9, 10, 11, 5, 7)
+    "collinearity_threshold": 0.97,
+    "quantile_knots": True,
+    "enable_monotonic": True,
+    "enable_interactions": False,
+    "interaction_n_splines": 6,
+    "interaction_lam": 10.0,
+    "iterative_refits": 1,
+    "bagging": {"enabled": False, "n_bags": 10, "block_length": 21,
+                "random_state": 0, "n_jobs": 1},
+    "expectile_levels": [0.05, 0.50, 0.95],
+    "conformal_alpha": 0.10,
 }
 
 _PRESET_KEYS = {"active_mode", "fast", "thorough"}
@@ -90,7 +102,7 @@ def load_config(path: str | None = None) -> dict:
         path = Path(path)
 
     if path.exists():
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
     else:
         # Minimal config from environment variables
@@ -121,6 +133,7 @@ def load_config(path: str | None = None) -> dict:
                 "lag_days": [1, 7, 30],
                 "rolling_windows": [14, 50],
                 "target": "CL=F_close",
+                "target_transform": "log_return",
             },
             "model": {
                 "n_splines": 25,

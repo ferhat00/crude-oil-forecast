@@ -184,6 +184,276 @@ def plot_fan_chart_plotly(
     return fig
 
 
+# ── Fan chart in price space (works for log-return targets) ─────────────────
+
+def plot_fan_chart_price_space_plotly(
+    dates: pd.DatetimeIndex,
+    y_true_price: np.ndarray,
+    y_pred_price: np.ndarray,
+    y_pred_model: np.ndarray,
+    sigma_model: np.ndarray,
+    anchor: np.ndarray,
+    dist: PredictiveDistribution,
+    last_n_days: int = 500,
+    widths: list[float] | None = None,
+    target_transform: str = "log_return",
+    sigma_scale: float = 1.0,
+) -> go.Figure:
+    """Fan chart whose bands are constructed in MODEL space then mapped to price.
+
+    Required when the GAM was trained on log-returns: the Johnson SU bands live
+    in return space, so each band's lower/upper is exp-transformed against the
+    aligned anchor price ``P_t``.  When ``target_transform == "level"`` this
+    reduces to the standard Johnson SU intervals.
+
+    Args:
+        dates: Forecast dates (one per row).
+        y_true_price: Realised price at each date.
+        y_pred_price: Point forecast in price space.
+        y_pred_model: Raw GAM output (before transform).
+        sigma_model: Per-row predictive σ in model space.
+        anchor: Anchor price ``P_t`` aligned with each forecast.
+        dist: Fitted Johnson SU on model-space residuals.
+        last_n_days: Trim the chart to the most recent N rows.
+        widths: PI levels.
+        target_transform: ``"log_return"`` or ``"level"``.
+        sigma_scale: Multiplicative inflation factor on σ.
+    """
+    if widths is None:
+        widths = _CI_LEVELS
+
+    n = min(last_n_days, len(dates))
+    dates_n = dates[-n:]
+    y_true_n = y_true_price[-n:]
+    y_pred_n = y_pred_price[-n:]
+    y_pred_model_n = y_pred_model[-n:]
+    sigma_n = sigma_model[-n:] * sigma_scale
+    anchor_n = anchor[-n:]
+
+    fig = go.Figure()
+    space_tag = " (Johnson SU on log-returns → price)" if target_transform == "log_return" else " (Johnson SU)"
+
+    for width, fill in zip(reversed(widths), reversed(_CI_FILL_RGBA[: len(widths)])):
+        q_lo, q_hi = (1 - width) / 2, (1 + width) / 2
+        r_lo = dist.ppf_array(q_lo, y_pred_model_n, sigma_n)
+        r_hi = dist.ppf_array(q_hi, y_pred_model_n, sigma_n)
+        if target_transform == "log_return":
+            lower = anchor_n * np.exp(r_lo)
+            upper = anchor_n * np.exp(r_hi)
+        else:
+            lower, upper = r_lo, r_hi
+        label = f"{int(width * 100)}% PI{space_tag}"
+
+        fig.add_trace(go.Scatter(
+            x=dates_n, y=upper, mode="lines",
+            line=dict(width=0),
+            name=label, legendgroup=label, showlegend=True,
+            hovertemplate=f"{label} upper: $%{{y:.2f}}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=dates_n, y=lower, mode="lines",
+            line=dict(width=0), fillcolor=fill, fill="tonexty",
+            name=label, legendgroup=label, showlegend=False,
+            hovertemplate=f"{label} lower: $%{{y:.2f}}<extra></extra>",
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=dates_n, y=y_pred_n, mode="lines", name="Point forecast",
+        line=dict(color="#08306b", width=1.5),
+        hovertemplate="Forecast: $%{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dates_n, y=y_true_n, mode="lines", name="Actual",
+        line=dict(color="black", width=1, dash="dot"),
+        hovertemplate="Actual: $%{y:.2f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title=f"Crude Oil Forecast Fan Chart{space_tag}",
+        xaxis_title="Date", yaxis_title="Price (USD)",
+        template="plotly_white", hovermode="x unified",
+        xaxis=dict(rangeslider=dict(visible=True), type="date"),
+        height=550,
+    )
+    return fig
+
+
+def plot_predictive_density_price_space_plotly(
+    mu_model: float,
+    sigma_model: float,
+    anchor: float,
+    dist: PredictiveDistribution,
+    y_actual_price: float | None = None,
+    title: str = "Predictive Distribution (price space)",
+    target_transform: str = "log_return",
+    widths: list[float] | None = None,
+    obs_idx: int | None = None,
+) -> go.Figure:
+    """Single-date predictive PDF in PRICE space.
+
+    For log-return targets, builds a fine x-grid in **return** space, computes
+    Johnson SU densities there, then change-of-variables transforms to price
+    via ``p = anchor · exp(r)`` and Jacobian ``1 / p``.  This preserves the
+    skew + heavy tails of the Johnson SU.
+
+    For level targets, falls back to the standard Johnson SU PDF in price space.
+    """
+    if widths is None:
+        widths = _CI_LEVELS
+
+    if target_transform == "log_return":
+        r_lo = float(dist.ppf(0.001, mu_model, sigma_model, idx=obs_idx))
+        r_hi = float(dist.ppf(0.999, mu_model, sigma_model, idx=obs_idx))
+        margin = (r_hi - r_lo) * 0.1
+        r_grid = np.linspace(r_lo - margin, r_hi + margin, 1000)
+        pdf_r = dist.pdf(r_grid, mu_model, sigma_model, idx=obs_idx)
+        # Change of variables: density on price = density on return / (anchor·exp(r))
+        x_grid = anchor * np.exp(r_grid)
+        pdf_x = pdf_r / np.clip(x_grid, 1e-6, None)
+    else:
+        x_lo = float(dist.ppf(0.001, mu_model, sigma_model, idx=obs_idx))
+        x_hi = float(dist.ppf(0.999, mu_model, sigma_model, idx=obs_idx))
+        margin = (x_hi - x_lo) * 0.1
+        x_grid = np.linspace(x_lo - margin, x_hi + margin, 1000)
+        pdf_x = dist.pdf(x_grid, mu_model, sigma_model, idx=obs_idx)
+
+    fig = go.Figure()
+
+    for width, fill in zip(reversed(widths), reversed(_CI_FILL_RGBA[: len(widths)])):
+        q_lo, q_hi = (1 - width) / 2, (1 + width) / 2
+        if target_transform == "log_return":
+            lo = anchor * np.exp(float(dist.ppf(q_lo, mu_model, sigma_model, idx=obs_idx)))
+            hi = anchor * np.exp(float(dist.ppf(q_hi, mu_model, sigma_model, idx=obs_idx)))
+        else:
+            lo = float(dist.ppf(q_lo, mu_model, sigma_model, idx=obs_idx))
+            hi = float(dist.ppf(q_hi, mu_model, sigma_model, idx=obs_idx))
+        mask = (x_grid >= lo) & (x_grid <= hi)
+        x_band = np.concatenate([[lo], x_grid[mask], [hi]])
+        # Interpolate band edges onto pdf for cleaner fills
+        y_lo_pdf = float(np.interp(lo, x_grid, pdf_x))
+        y_hi_pdf = float(np.interp(hi, x_grid, pdf_x))
+        y_band = np.concatenate([[y_lo_pdf], pdf_x[mask], [y_hi_pdf]])
+        fig.add_trace(go.Scatter(
+            x=x_band, y=y_band, mode="lines", fill="tozeroy",
+            fillcolor=fill, line=dict(width=0),
+            name=f"{int(width * 100)}% PI  [${lo:.1f} – ${hi:.1f}]",
+            hoverinfo="skip",
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=x_grid, y=pdf_x, mode="lines",
+        line=dict(color="#08306b", width=2.5),
+        name="Predictive PDF",
+        hovertemplate="Price: $%{x:.2f}<br>Density: %{y:.5f}<extra></extra>",
+    ))
+
+    if target_transform == "log_return":
+        mu_price = anchor * np.exp(mu_model)
+    else:
+        mu_price = mu_model
+    fig.add_vline(
+        x=mu_price, line=dict(color="#08306b", dash="dash", width=1.5),
+        annotation_text=f"Forecast<br>${mu_price:.2f}", annotation_position="top right",
+        annotation_font_color="#08306b",
+    )
+    if y_actual_price is not None:
+        fig.add_vline(
+            x=y_actual_price, line=dict(color="crimson", dash="solid", width=1.5),
+            annotation_text=f"Actual<br>${y_actual_price:.2f}", annotation_position="top left",
+            annotation_font_color="crimson",
+        )
+
+    fig.update_layout(
+        title=title, xaxis_title="Crude Oil Price (USD)", yaxis_title="Probability Density",
+        template="plotly_white", height=450, showlegend=True,
+        legend=dict(x=1.01, y=1, xanchor="left"),
+    )
+    return fig
+
+
+def plot_backtest_path(
+    path: pd.DataFrame,
+    last_n_days: int = 500,
+    show_pi_widths: tuple[int, ...] = (95,),
+) -> go.Figure:
+    """Plot the walk-forward backtest path with selected PI bands."""
+    df = path.sort_index().tail(last_n_days)
+    fig = go.Figure()
+    for w in show_pi_widths:
+        lo_col, hi_col = f"lower_{w}", f"upper_{w}"
+        if lo_col in df.columns and hi_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[hi_col], mode="lines", line=dict(width=0),
+                name=f"{w}% PI", legendgroup=f"PI{w}", showlegend=True,
+                hovertemplate=f"{w}% PI upper: $%{{y:.2f}}<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[lo_col], mode="lines",
+                line=dict(width=0), fill="tonexty",
+                fillcolor="rgba(107, 174, 214, 0.20)",
+                name=f"{w}% PI", legendgroup=f"PI{w}", showlegend=False,
+                hovertemplate=f"{w}% PI lower: $%{{y:.2f}}<extra></extra>",
+            ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["y_pred"], mode="lines",
+        line=dict(color="#ff7f0e", width=1.4), name="GAM forecast (walk-forward)",
+        hovertemplate="GAM: $%{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["y_anchor"], mode="lines",
+        line=dict(color="#d62728", width=0.9, dash="dash"), name="Naive (today)",
+        hovertemplate="Naive: $%{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["y_true"], mode="lines",
+        line=dict(color="black", width=1.0), name="Actual",
+        hovertemplate="Actual: $%{y:.2f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Walk-Forward Backtest Path (last {last_n_days} days)",
+        xaxis_title="Date", yaxis_title="Price (USD)",
+        template="plotly_white", hovermode="x unified",
+        xaxis=dict(rangeslider=dict(visible=True), type="date"),
+        height=520,
+    )
+    return fig
+
+
+def plot_rolling_mae_plotly(
+    path: pd.DataFrame,
+    window: int = 63,
+) -> go.Figure:
+    """Plot rolling MAE for GAM vs naive on the walk-forward path."""
+    df = path.sort_index()
+    abs_err_gam = (df["y_true"] - df["y_pred"]).abs()
+    abs_err_naive = (df["y_true"] - df["y_anchor"]).abs()
+    roll_gam = abs_err_gam.rolling(window, min_periods=window).mean()
+    roll_naive = abs_err_naive.rolling(window, min_periods=window).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=roll_gam, mode="lines",
+        name=f"GAM rolling {window}d MAE", line=dict(color="#08306b", width=1.6),
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=roll_naive, mode="lines",
+        name=f"Naive rolling {window}d MAE", line=dict(color="#d62728", width=1.0, dash="dash"),
+    ))
+    if roll_gam.notna().any():
+        thresh = float(np.nanpercentile(roll_gam, 95))
+        fig.add_hline(
+            y=thresh, line=dict(color="orange", dash="dash", width=1),
+            annotation_text=f"95th-pct = {thresh:.2f}",
+            annotation_position="top left",
+        )
+    fig.update_layout(
+        title=f"Rolling {window}-Day MAE — Concept-Drift Monitor",
+        xaxis_title="Date", yaxis_title="MAE (USD)",
+        template="plotly_white", hovermode="x unified", height=400,
+    )
+    return fig
+
+
 # ── Predictive density ───────────────────────────────────────────────────────
 
 def plot_predictive_density_plotly(

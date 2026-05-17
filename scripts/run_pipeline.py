@@ -28,6 +28,7 @@ from src.eda import run_eda
 from src.evaluation import get_prediction_sigma, run_evaluation
 from src.model import (
     build_feature_matrix,
+    conformal_residual_quantile,
     load_feature_names,
     load_model,
     reconstruct_price_from_returns,
@@ -163,6 +164,35 @@ def main() -> None:
     forecast_date = df.index[-1] + pd.offsets.BDay(1)
     last_close = float(df[target].iloc[-1])
 
+    # Split-conformal PI calibration: if a walk-forward backtest is
+    # available, use its OOS residuals to compute the empirical 95%
+    # nonconformity quantile in MODEL space.  Fall back to the Gaussian
+    # 1.96 when no path is available (e.g., --skip-backtest).  This
+    # guarantees marginal 95% coverage under exchangeability, even when
+    # the Johnson SU shape is mis-specified.
+    pi_multiplier = 1.96
+    if bt_result is not None and len(bt_result.path) > 50:
+        if target_transform == "log_return":
+            y_true_model_bt = np.log(
+                bt_result.path["y_true"].values
+                / np.clip(bt_result.path["y_anchor"].values, 1e-12, None)
+            )
+        else:
+            y_true_model_bt = bt_result.path["y_true"].values
+        try:
+            pi_multiplier = conformal_residual_quantile(
+                y_true_model_bt,
+                bt_result.path["y_pred_model"].values,
+                sigma=bt_result.path["sigma_model"].values,
+                alpha=0.05,
+            )
+            logger.info(
+                f"Conformal PI multiplier (α=0.05): {pi_multiplier:.3f} "
+                f"(vs Gaussian 1.96)"
+            )
+        except Exception as exc:
+            logger.warning(f"Conformal calibration failed ({exc}); using Gaussian 1.96")
+
     if target_transform == "log_return":
         forecast_mu_price = float(reconstruct_price_from_returns(
             np.array([forecast_mu_model]), np.array([last_close]),
@@ -170,13 +200,13 @@ def main() -> None:
         # Delta-method PI: σ_p ≈ P · σ_r (good when r is small)
         forecast_sigma_price = last_close * forecast_sigma_model
         # Asymmetric PI in price space using exp transform
-        pi_lower = last_close * np.exp(forecast_mu_model - 1.96 * forecast_sigma_model)
-        pi_upper = last_close * np.exp(forecast_mu_model + 1.96 * forecast_sigma_model)
+        pi_lower = last_close * np.exp(forecast_mu_model - pi_multiplier * forecast_sigma_model)
+        pi_upper = last_close * np.exp(forecast_mu_model + pi_multiplier * forecast_sigma_model)
     else:
         forecast_mu_price = forecast_mu_model
         forecast_sigma_price = forecast_sigma_model
-        pi_lower = forecast_mu_price - 1.96 * forecast_sigma_price
-        pi_upper = forecast_mu_price + 1.96 * forecast_sigma_price
+        pi_lower = forecast_mu_price - pi_multiplier * forecast_sigma_price
+        pi_upper = forecast_mu_price + pi_multiplier * forecast_sigma_price
 
     logger.info(f"Last trading day:    {df.index[-1].date()}")
     logger.info(f"Last close:          ${last_close:.2f}")
@@ -194,6 +224,7 @@ def main() -> None:
         "sigma": round(forecast_sigma_price, 2),
         "pi_95_lower": round(pi_lower, 2),
         "pi_95_upper": round(pi_upper, 2),
+        "pi_multiplier": round(pi_multiplier, 4),
     }
     if target_transform == "log_return":
         forecast_data["forecast_log_return"] = round(forecast_mu_model, 5)

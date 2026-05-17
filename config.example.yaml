@@ -42,6 +42,16 @@ data:
     # Note: US oil rig count (Baker Hughes) is not available via EIA API v2
     nat_gas_stocks:    "NG.NW2_EPG0_SWO_R48_BCF.W"  # Natural gas storage lower-48 (BCF, weekly)
 
+  # ── Optional: per-series FRED publication-lag overrides (calendar days) ──
+  # Defaults in src/data_engineering.py FRED_PUBLICATION_LAG_DAYS are
+  # conservative upper bounds based on each agency's release calendar.
+  # Override here if you know a tighter publication schedule.  Pass {} to
+  # disable FRED shifting entirely.  Keys match the descriptive names under
+  # `fred_series:` above.
+  # fred_publication_lags:
+  #   unemployment: 38
+  #   cpi: 45
+
 alpha_vantage:
   api_key: "YOUR_ALPHA_VANTAGE_API_KEY"  # https://www.alphavantage.co/support/#api-key
   base_url: "https://www.alphavantage.co/query"
@@ -116,6 +126,12 @@ features:
   bollinger_window: 20              # Bollinger Band window
   rsi_period: 14                    # RSI lookback period
   target: "CL=F_close"
+  # ── Target transformation ────────────────────────────────────────────────
+  # 'level'      = predict raw price (legacy; lag_1 dominates because the
+  #                price series is near-random-walk, masking real signal).
+  # 'log_return' = predict log(P_{t+1}/P_t); price reconstructed on display.
+  #                Stationary target lets structural features carry weight.
+  target_transform: "log_return"
 
   # ── MACD parameters (previously hardcoded 12/26/9) ──────────────────────
   macd_fast: 12
@@ -150,13 +166,16 @@ features:
 model:
   active_mode: fast                    # "fast" or "thorough"
 
-  # ── Fast preset: fewer lambdas, no hard cap, fewer steps/folds ───────────
+  # ── Fast preset: fewer lambdas, soft hard cap, moderate steps/folds ──────
+  # Hard cap target_max_terms=30 gives n/k ≈ 25 on ~750 obs (rough floor
+  # for parametric stability).  λ floor of 0.1 keeps splines genuinely
+  # regularised — λ=0.01 with n_splines=25 was effectively unconstrained.
   fast:
     stepwise_selection: true
     stepwise_criterion: aic
-    stepwise_max_steps: 15
-    target_max_terms: null             # No hard-cap stage
-    lam_search: [0.01, 1, 100]
+    stepwise_max_steps: 50
+    target_max_terms: 30
+    lam_search: [0.1, 1, 10, 100]
     cv_splits: 3
     sigma_stepwise: true
     sigma_max_terms: null
@@ -169,7 +188,7 @@ model:
     stepwise_criterion: bic
     stepwise_max_steps: 50
     target_max_terms: 25               # Hard cap on mu model terms
-    lam_search: [0.001, 0.01, 0.1, 1, 10, 100]
+    lam_search: [0.1, 1, 10, 100, 1000]
     cv_splits: 5
     sigma_stepwise: true
     sigma_max_terms: 12

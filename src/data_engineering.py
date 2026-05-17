@@ -37,6 +37,49 @@ PUBLICATION_LAG_DAYS = {
 }
 
 
+# Per-series FRED publication lags (calendar days) keyed by the descriptive
+# column name (the keys of `data.fred_series` in config.yaml).  FRED indexes
+# monthly observations at the reference month's first day, but BLS/BEA/Fed
+# Board don't release the data until weeks later — forward-filling on the
+# reference date lets the model peek ahead at month-end boundaries, which is
+# the signature that drove `unemployment`, `cpi`, `is_month_end` to the top
+# of the leaderboard with p≈1e-16 on the 2026-05-16 daily report.
+#
+# Defaults are conservative upper bounds based on each agency's release
+# calendar.  Series whose descriptive name is not in this map default to 0
+# (no shift); a warning is logged so the user can add an entry if needed.
+# Per-series overrides can be passed via `data.fred_publication_lags` in
+# config.yaml; an empty dict disables shifting (used by tests).
+FRED_PUBLICATION_LAG_DAYS = {
+    # ── Monthly series (indexed at month-start by FRED convention) ────────
+    "unemployment": 38,   # BLS Employment Situation, ~1st Fri next month
+    "cpi":          45,   # BLS CPI, ~10th–15th next month
+    "indpro":       48,   # FRB G.17, ~15th–17th next month
+    "oil_prod_ip":  48,   # FRB G.17 sub-series, same release
+    "cap_util":     48,   # FRB G.17 sub-series, same release
+    "pmi_mfg":      32,   # ISM PMI, 1st business day next month
+    "miles_driven": 75,   # FHWA traffic volume trends, ~2-month lag
+    "epu_global":   38,   # Global EPU monthly, early next month
+    # ── Weekly series (indexed at week-ending day) ───────────────────────
+    "nfci":          7,   # Chicago Fed, Wed release for prior Fri week
+    "stlfsi":        7,   # St. Louis Fed FSI4, weekly Thu release
+    "fed_balance":   7,   # FRB H.4.1, Thu release for prior Wed
+    "retail_gas":    7,   # EIA via FRED, weekly Mon release
+    # ── Daily series (released same day or next; no shift needed) ────────
+    "usd_index":   0,
+    "fed_funds":   0,
+    "t10y2y":      0,
+    "t5yie":       0,
+    "t10yie":      0,
+    "ovx":         0,
+    "hy_spread":   0,
+    "epu_us":      0,
+    "ig_spread":   0,
+    "ted_spread":  0,
+    "rrp":         0,
+}
+
+
 def _shift_publication_lag(df: pd.DataFrame, lag_days: int) -> pd.DataFrame:
     """Return *df* with its DatetimeIndex shifted forward by *lag_days*.
 
@@ -59,23 +102,25 @@ def merge_datasets(
     cot_df: pd.DataFrame | None = None,
     alpha_vantage_df: pd.DataFrame | None = None,
     publication_lags: dict[str, int] | None = None,
+    fred_publication_lags: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Merge all data sources on date index, accounting for publication lag.
 
     EIA, COT, and Alpha Vantage data (weekly/monthly) are first **shifted
     forward by their real publication lag** (so e.g. an EIA series for the
     week ending Friday is only visible from the following Wednesday onward),
-    then resampled to daily via forward-fill before merging.  All DataFrames
-    are left-joined on the oil price base index, then forward-filled to
-    handle weekends/holidays.
+    then resampled to daily via forward-fill before merging.  FRED series
+    are shifted **per-column** by :data:`FRED_PUBLICATION_LAG_DAYS` (with
+    config override): monthly BLS/BEA series (UNRATE, CPI, INDPRO, etc.) are
+    indexed by FRED at the reference month-start but only released weeks
+    later, so an unshifted join is a look-ahead bias.  All DataFrames are
+    left-joined on the oil price base index, then forward-filled to handle
+    weekends/holidays.
 
     Args:
         oil_df: Daily oil OHLCV data (WTI + Brent).
-        fred_df: Daily/irregular FRED macro data.  FRED already publishes by
-            release-date (its index is the data's reference date but daily
-            macro series like DTWEXBGS are released same-day) so no extra
-            shift is applied here.  Mixed-frequency FRED series may still
-            have small look-ahead but the effect is dominated by EIA/COT.
+        fred_df: FRED macro data, columns named by descriptive keys from
+            ``config.data.fred_series`` (e.g. ``unemployment``, ``cpi``).
         eia_dfs: Dict of EIA DataFrames with weekly/monthly frequency.
         market_df: Optional DataFrame of broad market close prices.
         cot_df: Optional weekly CFTC COT positioning DataFrame.
@@ -83,6 +128,10 @@ def merge_datasets(
         publication_lags: Optional override for default publication lags
             in :data:`PUBLICATION_LAG_DAYS`.  Pass an empty dict to disable
             shifting entirely (useful for tests).
+        fred_publication_lags: Optional override for default per-series FRED
+            publication lags in :data:`FRED_PUBLICATION_LAG_DAYS`, keyed by
+            descriptive column name.  Pass an empty dict to disable FRED
+            shifting (useful for tests).
 
     Returns:
         Merged DataFrame with daily frequency and no gaps in the oil series.
@@ -90,12 +139,47 @@ def merge_datasets(
     # Only fall back to defaults when publication_lags is None (not when empty
     # dict — passing {} explicitly disables shifting, which tests rely on).
     lags = PUBLICATION_LAG_DAYS if publication_lags is None else dict(publication_lags)
+    fred_lags = (
+        FRED_PUBLICATION_LAG_DAYS
+        if fred_publication_lags is None
+        else dict(fred_publication_lags)
+    )
 
     # Start with oil prices as the base (daily trading days)
     merged = oil_df.copy()
 
+    # Shift each FRED column independently by its publication lag before
+    # joining.  Columns absent from the lag map default to 0 (no shift) but
+    # are logged so a user adding a new monthly series sees the warning.
+    # Shifted values can land on weekends/holidays (e.g. UNRATE@2026-05-01
+    # +38d → 2026-06-08 Mon, fine; +35d → Sat, missed).  Resample to
+    # calendar-daily ffill before joining so the trailing merged.ffill is
+    # not required to recover them.
+    if fred_lags and not fred_df.empty:
+        unknown = [c for c in fred_df.columns if c not in fred_lags]
+        if unknown:
+            logger.warning(
+                "FRED columns missing from FRED_PUBLICATION_LAG_DAYS (defaulting "
+                "to lag=0; add an entry if any are monthly/weekly): %s",
+                unknown,
+            )
+        pieces = []
+        for col in fred_df.columns:
+            lag = int(fred_lags.get(col, 0))
+            s = fred_df[[col]].dropna()
+            if lag > 0:
+                s = s.copy()
+                s.index = s.index + pd.Timedelta(days=lag)
+            pieces.append(s)
+        fred_to_join = pd.concat(pieces, axis=1).sort_index()
+        # Calendar-daily ffill so any shifted date lands on the next
+        # available business day after the join.
+        fred_to_join = fred_to_join.resample("D").ffill()
+    else:
+        fred_to_join = fred_df
+
     # Join FRED data (left join — FRED may have gaps on weekends)
-    merged = merged.join(fred_df, how="left")
+    merged = merged.join(fred_to_join, how="left")
 
     # Resample EIA data to daily and join (shift to publication date first)
     eia_lag = int(lags.get("eia", 0))
@@ -904,10 +988,13 @@ def build_features(config: dict) -> pd.DataFrame:
     logger.info(f"Oil price columns: {list(oil_df.columns)}")
 
     # ── Merge ─────────────────────────────────────────
+    data_cfg = config.get("data", {})
     df = merge_datasets(
         oil_df, fred_df, eia_dfs, market_df,
         cot_df=cot_df,
         alpha_vantage_df=alpha_vantage_df,
+        publication_lags=data_cfg.get("publication_lags"),
+        fred_publication_lags=data_cfg.get("fred_publication_lags"),
     )
     logger.info(f"Merged columns: {list(df.columns)}")
 

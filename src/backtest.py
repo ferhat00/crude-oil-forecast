@@ -190,7 +190,24 @@ def run_walk_forward_backtest(
     # Per-row containers
     path_rows: list[dict] = []
 
+    # Accumulators for out-of-sample residuals — used to refit the
+    # per-fold `dist` once we have enough.  Training-only residuals are
+    # tiny under in-sample overfitting (Pseudo R² ≈ 1), which collapses
+    # the predictive PIs and was the proximate cause of the empirical
+    # 50% coverage being ~5% on the 2026-05-16 report.
+    OOS_DIST_REFIT_MIN = 200  # rows of OOS residuals before switching
+    OOS_DIST_REFIT_TAIL = 1000  # use the most recent N when refitting
+    oos_y_true_model: list[float] = []
+    oos_y_pred_model: list[float] = []
+    oos_sigma_model: list[float] = []
+
     for model_version, train_end in enumerate(refit_starts, start=1):
+        # No embargo gap is needed for walk-forward: train always precedes
+        # test, and rolling features only look backwards.  The CV-side
+        # EmbargoedTimeSeriesSplit guards against a K-fold-style leakage
+        # (train rows AFTER test seeing test's target via rolling windows)
+        # that cannot occur in an expanding-window walk-forward.  Forecast
+        # at T uses information legitimately available at T.
         test_start = train_end
         test_end = min(train_end + test_period, n)
         if test_end <= test_start:
@@ -230,14 +247,38 @@ def run_walk_forward_backtest(
         terms = define_gam_terms(feature_names, config)
         gam = fit_gam(X_train_sel, y_train, terms, lam_values, n_jobs=n_jobs)
 
-        # Predictive distribution fitted on training residuals (proxy for σ)
-        sigma_train = get_prediction_sigma(gam, X_train_sel)
-        y_pred_train = gam.predict(X_train_sel)
-        try:
-            dist = fit_residual_distribution(y_train, y_pred_train, sigma_train)
-        except Exception as exc:
-            logger.warning(f"  fold {model_version}: Johnson SU fit failed ({exc}) — using Gaussian fallback")
-            dist = PredictiveDistribution(nu=0.0, tau=1.0, loc_std=0.0, scale_std=1.0)
+        # Predictive distribution: prefer accumulated OOS residuals from
+        # prior folds (conformal-ish — calibration that production could
+        # also do).  Fall back to training residuals only for the first
+        # few folds before the OOS buffer is large enough to be reliable.
+        if len(oos_y_true_model) >= OOS_DIST_REFIT_MIN:
+            tail = OOS_DIST_REFIT_TAIL
+            y_calib = np.asarray(oos_y_true_model[-tail:], dtype=np.float64)
+            mu_calib = np.asarray(oos_y_pred_model[-tail:], dtype=np.float64)
+            sigma_calib = np.asarray(oos_sigma_model[-tail:], dtype=np.float64)
+            try:
+                dist = fit_residual_distribution(y_calib, mu_calib, sigma_calib)
+            except Exception as exc:
+                logger.warning(
+                    f"  fold {model_version}: OOS Johnson SU fit failed ({exc}) — "
+                    "falling back to training residuals"
+                )
+                sigma_train = get_prediction_sigma(gam, X_train_sel)
+                y_pred_train = gam.predict(X_train_sel)
+                try:
+                    dist = fit_residual_distribution(y_train, y_pred_train, sigma_train)
+                except Exception:
+                    dist = PredictiveDistribution(nu=0.0, tau=1.0, loc_std=0.0, scale_std=1.0)
+        else:
+            sigma_train = get_prediction_sigma(gam, X_train_sel)
+            y_pred_train = gam.predict(X_train_sel)
+            try:
+                dist = fit_residual_distribution(y_train, y_pred_train, sigma_train)
+            except Exception as exc:
+                logger.warning(
+                    f"  fold {model_version}: Johnson SU fit failed ({exc}) — using Gaussian fallback"
+                )
+                dist = PredictiveDistribution(nu=0.0, tau=1.0, loc_std=0.0, scale_std=1.0)
 
         # Out-of-sample predictions
         y_pred_model = gam.predict(X_test_sel)
@@ -279,6 +320,15 @@ def run_walk_forward_backtest(
                 row[f"upper_{int(w * 100)}"] = float(bands_price[w][j, 1])
             path_rows.append(row)
 
+        # Accumulate OOS residuals (all in MODEL space) for the next
+        # fold's dist refit.  y_test_model is the true target in model
+        # space (log-return when target_transform="log_return", price
+        # otherwise); y_pred_model is the fold's GAM prediction in the
+        # same space; sigma_test is the GAM's per-row σ in model space.
+        oos_y_true_model.extend(float(v) for v in y_test_model)
+        oos_y_pred_model.extend(float(v) for v in y_pred_model)
+        oos_sigma_model.extend(float(v) for v in sigma_test)
+
         if model_version % 10 == 0 or model_version == len(refit_starts):
             mean_mae = float(np.mean(np.abs(y_test_level - y_pred_price)))
             logger.info(
@@ -311,22 +361,27 @@ def run_walk_forward_backtest(
             np.mean((path["y_true"].values >= lo) & (path["y_true"].values <= hi))
         )
 
-    # Probabilistic scores in MODEL SPACE (uses the per-row σ and the average
-    # Johnson SU shape across folds; rough but consistent across runs).
+    # Probabilistic scores in MODEL SPACE.  Refit Johnson SU on the full
+    # OOS path (this is "leaky" in a calibration sense — it uses all path
+    # residuals — but produces an honest summary of distributional skill
+    # for cross-run comparison).  Earlier versions mixed a price-space
+    # residual into a model-space mean here, which happened to produce
+    # plausible-looking numbers but is mathematically wrong; fixed.
     try:
-        dist_global = fit_residual_distribution(
-            path["y_pred_model"].values + (path["y_true"].values - path["y_pred"].values),
-            path["y_pred_model"].values,
-            path["sigma_model"].values,
-        )
-        # Note: above is approximate — true would refit per fold.  Sufficient
-        # for cross-run comparisons.
         if target_transform == "log_return":
             y_anchor_for_dir = np.zeros_like(path["y_pred_model"].values)
-            y_true_model = np.log(path["y_true"].values / np.clip(path["y_anchor"].values, 1e-12, None))
+            y_true_model = np.log(
+                path["y_true"].values
+                / np.clip(path["y_anchor"].values, 1e-12, None)
+            )
         else:
             y_anchor_for_dir = path["y_anchor"].values
             y_true_model = path["y_true"].values
+        dist_global = fit_residual_distribution(
+            y_true_model,
+            path["y_pred_model"].values,
+            path["sigma_model"].values,
+        )
         prob_scores = compute_probabilistic_scores(
             y_true_model,
             path["y_pred_model"].values,

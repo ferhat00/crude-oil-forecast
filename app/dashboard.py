@@ -148,7 +148,7 @@ def build_predictive_dist(
     feature_names = load_features(root)
     sub_names = load_sub_feature_names(root)
 
-    X_full, y, all_names, _target_dates = build_feature_matrix(
+    X_full, y, all_names, _target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     name_to_idx = {n: i for i, n in enumerate(all_names)}
@@ -213,7 +213,7 @@ def compute_calibrated_sigma_scale(
     target = cfg["features"]["target"]
     target_transform = cfg["features"].get("target_transform", "level")
     feature_names = load_features(root)
-    X_full, y, all_names, _target_dates = build_feature_matrix(
+    X_full, y, all_names, _target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     name_to_idx = {n: i for i, n in enumerate(all_names)}
@@ -286,7 +286,7 @@ def main():
 
     target = config["features"]["target"]
     target_transform = config["features"].get("target_transform", "level")
-    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+    X_full, y_model, all_feature_names, target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
 
@@ -297,7 +297,7 @@ def main():
     X = X_full[:, col_idx]
 
     # Latest feature row for live forecast (dropped by horizon shift)
-    X_full_latest, _, _, _ = build_feature_matrix(
+    X_full_latest, _, _, _, _ = build_feature_matrix(
         df, target, forecast_horizon=0, target_transform=target_transform,
     )
     X_latest = X_full_latest[-1:, :][:, col_idx]
@@ -395,7 +395,11 @@ def main():
         sigma_gam=sigma_gam_model, X_sigma=X_sigma,
     )
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # CPCV tab is only shown when results exist on disk
+    # (outputs/backtests/cpcv/summary.json).
+    cpcv_summary_path = Path(root) / "outputs" / "backtests" / "cpcv" / "summary.json"
+    show_cpcv_tab = cpcv_summary_path.exists()
+    tab_labels = [
         "Price Overview",
         "Model Performance",
         "Probability Forecast",
@@ -403,7 +407,12 @@ def main():
         "What-If Analysis",
         "Model Terms",
         "Backtest",
-    ])
+    ]
+    if show_cpcv_tab:
+        tab_labels.append("CPCV Distribution")
+    _tabs = st.tabs(tab_labels)
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = _tabs[:7]
+    tab8 = _tabs[7] if show_cpcv_tab else None
 
     # ── Tab 1: Price Overview ─────────────────────────────────────────────────
     with tab1:
@@ -907,6 +916,55 @@ def main():
                 if w.get("skill_vs_gam") is not None:
                     ccol3.metric("Skill vs GAM-alone",
                                  f"{w['skill_vs_gam'] * 100:+.2f}%")
+
+    # ── Tab 8: CPCV Distribution (only when results exist on disk) ────────────
+    if tab8 is not None:
+        with tab8:
+            st.subheader("Combinatorial Purged CV — Backtest Path Distribution")
+            st.markdown(
+                "Lopez de Prado's CPCV (Ch. 12) holds out every combination of "
+                "test groups and reassembles many independent backtest paths. "
+                "Each path Sharpe below is one of those alternative histories — "
+                "the spread tells you how lucky the single walk-forward path was."
+            )
+            import json as _json
+            summary = _json.loads(cpcv_summary_path.read_text())
+            metrics_path = cpcv_summary_path.parent / "paths_metrics.parquet"
+            try:
+                path_metrics = pd.read_parquet(metrics_path)
+            except Exception as _e:
+                st.error(f"Could not load CPCV metrics: {_e}")
+                path_metrics = None
+
+            cols = st.columns(4)
+            cols[0].metric("Paths", summary.get("n_paths", 0))
+            cols[1].metric("Sharpe mean", f"{summary.get('sharpe_mean', 0):.3f}")
+            cols[2].metric(
+                "Sharpe std", f"{summary.get('sharpe_std', 0):.3f}",
+                help="Lower = more stable across alternative histories.",
+            )
+            cols[3].metric(
+                "PBO proxy", f"{summary.get('pbo', 0):.1%}",
+                help=(
+                    "Fraction of CPCV paths with non-positive Sharpe. "
+                    "Above ~50% suggests the historical Sharpe is unlikely "
+                    "to repeat OOS."
+                ),
+            )
+
+            if path_metrics is not None and len(path_metrics):
+                import plotly.express as _px
+                fig = _px.histogram(
+                    path_metrics, x="sharpe", nbins=20,
+                    title="Sharpe distribution across CPCV paths",
+                )
+                fig.update_layout(
+                    xaxis_title="Annualised Sharpe", yaxis_title="Paths",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("Per-path metrics"):
+                    st.dataframe(path_metrics.round(4))
 
 
 # ── Helper imported inline to avoid circular deps ────────────────────────────

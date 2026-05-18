@@ -200,3 +200,13 @@ model:
   embargo_days: 200                    # Obs to drop between train/test boundary
   n_jobs: -1                           # Parallel workers: -1 = all CPUs
   nu_tau_window: 60                    # Rolling window for skewness/kurtosis
+
+# ── Combinatorial Purged Cross-Validation backtest (Ch. 12) ────────────────
+# Off by default; enable from the CLI with `python scripts/run_pipeline.py --cpcv`
+# or set enabled: true here.  Produces a distribution of backtest paths in
+# outputs/backtests/cpcv/ alongside the walk-forward path.
+cpcv:
+  enabled: false
+  n_splits: 6        # N — contiguous groups (book example: 6)
+  n_test_splits: 2   # k — groups per test combination (book example: 2)
+  pct_embargo: 0.01  # Fraction of total observations to embargo per fold

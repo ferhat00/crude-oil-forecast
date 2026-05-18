@@ -1095,7 +1095,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
 
     # Build the full feature matrix, then restrict to the columns the model
     # was actually trained on (stepwise selection may have dropped features).
-    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+    X_full, y_model, all_feature_names, target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
@@ -1211,7 +1211,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
                        dist=dist_model)
 
     # Genuine T+1 forecast: predict tomorrow using today's (last available) features
-    X_full_0, _, _, _ = build_feature_matrix(
+    X_full_0, _, _, _, _ = build_feature_matrix(
         df, target, forecast_horizon=0, target_transform=target_transform,
     )
     X_latest = X_full_0[-1:, col_idx]

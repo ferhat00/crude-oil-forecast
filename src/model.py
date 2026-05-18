@@ -122,7 +122,7 @@ def build_feature_matrix(
     target_col: str,
     forecast_horizon: int = 1,
     target_transform: str = "level",
-) -> tuple[np.ndarray, np.ndarray, list[str], pd.DatetimeIndex]:
+) -> tuple[np.ndarray, np.ndarray, list[str], pd.DatetimeIndex, pd.Series]:
     """Separate target from features with an optional forward target shift.
 
     When ``forecast_horizon >= 1`` the target is shifted forward so that
@@ -148,9 +148,16 @@ def build_feature_matrix(
             to a price scale.
 
     Returns:
-        Tuple of (X, y, feature_names, target_dates) where *target_dates*
-        is the DatetimeIndex of the dates being predicted and *y* is in
-        the requested transform space.
+        Tuple of (X, y, feature_names, target_dates, t1) where:
+
+        * ``target_dates`` is the DatetimeIndex of the dates being predicted
+          (i.e. ``t + forecast_horizon`` for each kept feature row at ``t``);
+        * ``y`` is in the requested transform space;
+        * ``t1`` is a pandas Series indexed by the feature-row date (the date
+          *at which features are observed*) whose values are the date by
+          which label ``y[i]`` is fully known — required by Lopez de Prado
+          purged/embargoed CV ([[purged-kfold]]).  For ``forecast_horizon=0``
+          ``t1[i] == index[i]`` (no future information needed).
     """
     # Columns to exclude: target itself and raw price/volume OHLCV columns
     # (we keep their engineered derivatives like lags, rolling, returns)
@@ -189,10 +196,16 @@ def build_feature_matrix(
         future_price = price_all[forecast_horizon:]
         anchor_price = price_all[:n_valid]
         target_dates = df.index[forecast_horizon:]
+        # t1 indexed by the *feature-row* date (df.index[:n_valid]); value is
+        # the date at which the corresponding label is fully observed.
+        feature_dates = df.index[:n_valid]
+        t1 = pd.Series(target_dates, index=feature_dates, name="t1")
     else:
         future_price = price_all
         anchor_price = price_all
         target_dates = df.index
+        # horizon=0 (live prediction): label needs no future info.
+        t1 = pd.Series(df.index, index=df.index, name="t1")
 
     if target_transform == "log_return":
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -209,7 +222,7 @@ def build_feature_matrix(
                 f"(horizon={forecast_horizon}, target_transform={target_transform})")
     logger.debug(f"Features: {feature_names}")
 
-    return X, y, feature_names, target_dates
+    return X, y, feature_names, target_dates, t1
 
 
 def compute_anchor_prices(
@@ -616,30 +629,55 @@ def define_gam_terms(
 
 
 class EmbargoedTimeSeriesSplit:
-    """Time series cross-validator with embargo gap (Lopez de Prado, 2018).
+    """Time series cross-validator with embargo (Lopez de Prado, 2018).
 
-    Rolling and lagged features computed on the full dataset cause data leakage
-    at each train/test boundary: e.g., a 200-day SMA for the first test
-    observation contains 199 days from the training period.
+    Two modes of operation:
 
-    Solution: drop `embargo_days` observations from the **start** of each
-    test fold, ensuring the test set only begins after rolling-window memory
-    has fully expired.  `embargo_days` should equal the largest rolling window
-    used during feature engineering (default 200).
+    * **t1-aware (preferred).** If ``t1`` is passed, this class delegates to
+      :class:`src.cv.PurgedKFold` — the canonical Chapter 7 algorithm.
+      Training rows whose label window overlaps the test fold are *purged*
+      (not the test rows), and ``pct_embargo = embargo_days / n_samples``
+      rows immediately after the test fold are dropped.
+    * **Legacy one-sided fallback (no t1).** Reproduces the original
+      behaviour of stripping ``embargo_days`` observations from the *start*
+      of each test fold.  Kept so existing call sites that have not yet
+      threaded ``t1`` continue to work unchanged.
 
     Args:
-        n_splits: Number of CV folds (passed to TimeSeriesSplit).
-        embargo_days: Observations to skip at the start of each test fold.
-            Set this to the maximum rolling window used in feature engineering.
+        n_splits: Number of CV folds.
+        embargo_days: Embargo window size in observations.  In legacy mode,
+            this is the number of test rows stripped at each fold boundary;
+            in t1-aware mode, it is the number of post-test rows embargoed.
+        t1: Optional Series of label end times (see :func:`build_feature_matrix`).
+            Required for the canonical purged behaviour.
     """
 
-    def __init__(self, n_splits: int = 5, embargo_days: int = 200) -> None:
+    def __init__(
+        self,
+        n_splits: int = 5,
+        embargo_days: int = 200,
+        t1: pd.Series | None = None,
+    ) -> None:
         self.n_splits = n_splits
         self.embargo_days = embargo_days
+        self.t1 = t1
 
     def split(
         self, X: np.ndarray, y=None, groups=None
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        # ── Preferred path: delegate to PurgedKFold when t1 is available ──
+        if self.t1 is not None:
+            from src.cv import PurgedKFold
+
+            n_samples = len(X)
+            pct_embargo = (self.embargo_days / n_samples) if n_samples else 0.0
+            inner = PurgedKFold(
+                n_splits=self.n_splits, t1=self.t1, pct_embargo=pct_embargo,
+            )
+            yield from inner.split(X)
+            return
+
+        # ── Legacy fallback: original one-sided embargo on the test side ──
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         for fold_num, (train_idx, test_idx) in enumerate(tscv.split(X), start=1):
             # The embargo cutoff: first index that is truly independent of training
@@ -771,6 +809,7 @@ def cross_validate(
     embargo_days: int = 200,
     lam_values: list[float] | None = None,
     n_jobs: int = 1,
+    t1: pd.Series | None = None,
 ) -> dict:
     """Perform embargoed time series cross-validation.
 
@@ -778,6 +817,11 @@ def cross_validate(
     1. We always predict future from past (no temporal leakage).
     2. Rolling/lag features computed on the full dataset do not bleed
        training-period information into test observations at fold boundaries.
+
+    When ``t1`` is supplied the splitter delegates to
+    :class:`src.cv.PurgedKFold` (canonical Chapter 7 purge + bilateral
+    embargo).  When omitted, the legacy one-sided test-side embargo is
+    used — kept for backward compatibility.
 
     Folds are fitted in parallel when ``n_jobs != 1``.  Each fold worker
     calls ``fit_gam`` with ``n_jobs=1`` to avoid nested parallelism.
@@ -787,12 +831,14 @@ def cross_validate(
         y: Target vector.
         terms: pyGAM terms expression.
         n_splits: Number of CV folds.
-        embargo_days: Observations to strip from the start of each test fold.
-            Should equal the largest rolling window used in feature engineering
-            (default 200 = the 200-day SMA window).
+        embargo_days: Embargo window size (observations).  In the t1-aware
+            path this becomes ``pct_embargo = embargo_days / n_samples``.
+            Should equal the largest rolling window used in feature
+            engineering (default 200 = the 200-day SMA window).
         lam_values: Lambda values for grid search.
         n_jobs: Number of parallel jobs for fold fitting.
             1 = sequential (default).  -1 = all logical CPUs.
+        t1: Optional label end-times series (see :func:`build_feature_matrix`).
 
     Returns:
         Dict with fold_metrics, mean_mae, mean_rmse, mean_mape, embargo_days.
@@ -800,12 +846,14 @@ def cross_validate(
     if lam_values is None:
         lam_values = np.logspace(-3, 3, 11).tolist()
 
-    splitter = EmbargoedTimeSeriesSplit(n_splits=n_splits, embargo_days=embargo_days)
+    splitter = EmbargoedTimeSeriesSplit(
+        n_splits=n_splits, embargo_days=embargo_days, t1=t1,
+    )
 
+    cv_mode = "purged-kfold (t1-aware)" if t1 is not None else "legacy one-sided"
     logger.info(
-        f"Starting {n_splits}-fold embargoed CV "
-        f"(embargo_days={embargo_days}, ~{embargo_days} obs stripped per fold, "
-        f"n_jobs={n_jobs})"
+        f"Starting {n_splits}-fold embargoed CV [{cv_mode}] "
+        f"(embargo_days={embargo_days}, n_jobs={n_jobs})"
     )
 
     # Pre-collect folds so we can dispatch them all at once
@@ -1321,7 +1369,7 @@ def train_and_save(config: dict) -> tuple:
     target = feat_cfg["target"]
 
     # ── Build feature matrix (in target_transform space) ──────────────────────
-    X, y, feature_names, target_dates = build_feature_matrix(
+    X, y, feature_names, target_dates, t1 = build_feature_matrix(
         df, target, target_transform=target_transform
     )
     logger.info(
@@ -1375,13 +1423,15 @@ def train_and_save(config: dict) -> tuple:
     # Build terms over the (possibly reduced) feature set.
     terms = define_gam_terms(feature_names, config)
 
-    # Cross-validate on selected features
+    # Cross-validate on selected features.  Pass `t1` so the splitter follows
+    # Chapter 7 purging instead of the legacy one-sided embargo.
     cv_results = cross_validate(
         X, y, terms,
         n_splits=model_cfg.get("cv_splits", 5),
         embargo_days=model_cfg.get("embargo_days", 200),
         lam_values=lam_values,
         n_jobs=n_jobs,
+        t1=t1,
     )
 
     # ── Stage 1: Fit final mu (location) model on full dataset ────────────────

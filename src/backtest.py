@@ -145,7 +145,7 @@ def run_walk_forward_backtest(
     if df is None:
         df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
 
-    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+    X_full, y_model, all_feature_names, target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     anchor = compute_anchor_prices(df, target, forecast_horizon=1)

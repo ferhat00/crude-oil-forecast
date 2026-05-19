@@ -962,7 +962,9 @@ def stepwise_aic_selection(
     gam = fit_gam(X[:, current_indices], y, terms, lam_values, n_jobs=n_jobs)
     n_samples = len(y)
     current_score = compute_bic(gam, n_samples) if criterion == "bic" else gam.statistics_["AIC"]
-    current_lam = gam.lam  # reuse for fast trial fits
+    # Scalar λ for trial fits — broadcasts safely across SplineTerm + TensorTerm
+    # (per-term list mutation breaks the term/penalty mapping when interactions are on).
+    trial_lam_scalar = float(np.median(lam_values))
 
     logger.info(
         f"Stepwise {criterion.upper()} selection — start: {len(current_indices)} features, "
@@ -990,9 +992,8 @@ def stepwise_aic_selection(
         trial_terms = _build_gam_terms_for_indices(trial_indices, feature_names, config)
 
         # Build a fixed-λ model (no grid-search) for speed
-        trial_lam = [lv for i, lv in enumerate(current_lam) if i != worst_local]
         trial_gam_fast = LinearGAM(trial_terms)
-        trial_gam_fast.lam = trial_lam
+        trial_gam_fast.lam = trial_lam_scalar
         trial_gam_fast.fit(X[:, trial_indices], y)
         trial_score = (
             compute_bic(trial_gam_fast, n_samples) if criterion == "bic"
@@ -1008,7 +1009,6 @@ def stepwise_aic_selection(
             current_indices = trial_indices
             gam = trial_gam_fast
             current_score = trial_score
-            current_lam = gam.lam
         else:
             logger.info(
                 f"  Step {step + 1}: keeping '{candidate_name}' "
@@ -1032,9 +1032,8 @@ def stepwise_aic_selection(
             candidate_name = feature_names[current_indices[worst_local]]
             trial_indices = [idx for i, idx in enumerate(current_indices) if i != worst_local]
             trial_terms = _build_gam_terms_for_indices(trial_indices, feature_names, config)
-            trial_lam = [lv for i, lv in enumerate(current_lam) if i != worst_local]
             trial_gam = LinearGAM(trial_terms)
-            trial_gam.lam = trial_lam
+            trial_gam.lam = trial_lam_scalar
             trial_gam.fit(X[:, trial_indices], y)
             logger.info(
                 f"  Hard-cap drop: '{candidate_name}' "
@@ -1043,7 +1042,6 @@ def stepwise_aic_selection(
             dropped_names.append(candidate_name)
             current_indices = trial_indices
             gam = trial_gam
-            current_lam = gam.lam
 
     selected_names = [feature_names[i] for i in current_indices]
     logger.info(

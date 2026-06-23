@@ -33,6 +33,8 @@ MACRO_PATTERNS = (
     "ig_spread", "ted_spread",
     # Binary seasonality flags (0/1 → linear term is appropriate)
     "driving_season", "heating_season", "us_holiday",
+    # Binary geopolitical-risk spike flag (0/1)
+    "gpr_spike",
 )
 # Cyclic spline (s, basis='cp'): calendar features that wrap around
 CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
@@ -40,6 +42,7 @@ CYCLIC_PATTERNS = ("day_of_week", "month", "day_of_year", "quarter")
 ROLLING_PATTERNS = (
     "_sma_", "_ema_", "_std_", "_bb_", "macd", "_rsi_", "crack_",
     "_atr_", "_williams_r_", "_stoch_", "_cmf_", "corr_", "_momentum_",
+    "_parkinson_", "_garman_klass_", "_rogers_satchell_", "_yang_zhang_",
 )
 # Spline: autoregressive and exogenous lags
 LAG_PATTERNS = ("_lag_",)
@@ -52,6 +55,7 @@ SPREAD_PATTERNS = ("_spread", "_ratio", "_dist_sma", "_pct_range", "_52w")
 SIGMA_FEATURE_PATTERNS = (
     "ovx", "vix", "_std_", "_bb_width", "hy_spread", "_log_return", "t5yie", "t10yie",
     "_atr_", "_atr_pct", "_stoch_", "_williams_r_", "nfci", "stlfsi",
+    "_parkinson_", "_garman_klass_", "_rogers_satchell_", "_yang_zhang_",
 )
 
 # Risk / regime patterns → candidate features for the nu (skewness) and tau (tail) sub-models
@@ -1498,6 +1502,29 @@ def train_and_save(config: dict) -> tuple:
         mu_pred = mu_gam.predict(X)
         mu_residuals = y - mu_pred
         sigma_pred = get_sigma_from_sigma_gam(sigma_gam, X_sigma)
+
+    # ── Phase 1: optional serial-volatility scale ─────────────────────────────
+    # The sigma-GAM captures level dependence but not GARCH-type clustering.
+    # When model.sigma_source is "garch"/"blend", filter a GARCH(1,1)/EWMA
+    # conditional σ from the final mu residuals and use it (or a variance blend)
+    # as the scale that standardises residuals for the ν/τ moments.
+    sigma_source = str(model_cfg.get("sigma_source", "gam")).lower()
+    if sigma_source in ("garch", "blend"):
+        from src.volatility import garch_conditional_sigma
+        cond = garch_conditional_sigma(mu_residuals)
+        if cond.sigma.size == len(mu_residuals):
+            if sigma_source == "garch":
+                sigma_pred = cond.sigma
+            else:  # blend variances 50/50
+                sigma_pred = np.sqrt(0.5 * sigma_pred ** 2 + 0.5 * cond.sigma ** 2)
+            logger.info(
+                f"sigma_source='{sigma_source}': applied {cond.kind} conditional σ "
+                f"to residual standardisation."
+            )
+        else:
+            logger.warning(
+                "sigma_source set but conditional σ length mismatch — keeping GAM σ."
+            )
 
     # ── Stage 3: Nu and Tau models (rolling moments of standardised residuals) ─
     nu_tau_window = model_cfg.get("nu_tau_window", 60)

@@ -23,6 +23,7 @@ Chapter 11, Section 11.6 (Probability of Backtest Overfitting via CSCV).
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import logging
 from pathlib import Path
@@ -31,12 +32,14 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from scipy import stats
 
 from src.cv import CombinatorialPurgedCV
 
 logger = logging.getLogger(__name__)
 
 ANNUALISATION = 252.0  # trading days per year
+EULER_MASCHERONI = 0.5772156649015329
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +227,140 @@ def _pbo_proxy(path_sharpes: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Probability of Backtest Overfit — full CSCV (Bailey et al., 2017)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _column_sharpe(block: np.ndarray) -> np.ndarray:
+    """Per-column (per-strategy) Sharpe of a (rows × strategies) return block."""
+    mean = np.nanmean(block, axis=0)
+    std = np.nanstd(block, axis=0, ddof=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sr = np.where(std > 0, mean / std, 0.0)
+    return sr
+
+
+def pbo_cscv(performance: np.ndarray, n_partitions: int = 16) -> dict:
+    """Probability of Backtest Overfitting via Combinatorially-Symmetric CV.
+
+    Implements Bailey, Borwein, Lopez de Prado & Zhu (2017).  ``performance``
+    is a ``(T × N)`` matrix of per-period performance (e.g. returns) for ``N``
+    *distinct* candidate strategies / configurations over ``T`` periods.  The
+    rows are split into ``S`` disjoint sub-matrices; for every way of choosing
+    ``S/2`` of them as the in-sample (IS) set:
+
+    1. pick the strategy with the highest IS Sharpe (the one a researcher
+       would have selected);
+    2. compute its *out-of-sample* rank among all strategies;
+    3. map that relative rank to the logit ``λ = ln(ω / (1-ω))``.
+
+    PBO is the fraction of splits where ``λ < 0`` — i.e. the IS-best strategy
+    lands below the OOS median.  A PBO near 0 means selection generalises;
+    near 0.5 means the selection is indistinguishable from chance (overfit).
+
+    Note: this is meaningful only with **≥ 2 genuinely different strategies**
+    (e.g. a λ grid, feature-selection variants, or the GAM vs challenger
+    models from later phases).  For a single model's CPCV paths use
+    :func:`_pbo_proxy` instead — there is no second strategy to rank against.
+
+    Returns:
+        Dict with ``pbo``, ``n_strategies``, ``n_combinations``,
+        ``lambda_mean``, ``lambda_median``.  ``pbo`` is NaN when N < 2.
+    """
+    M = np.asarray(performance, dtype=np.float64)
+    if M.ndim != 2:
+        raise ValueError("performance must be a 2D (T x N) array")
+    T, N = M.shape
+    if N < 2:
+        return {
+            "pbo": float("nan"), "n_strategies": int(N), "n_combinations": 0,
+            "lambda_mean": float("nan"), "lambda_median": float("nan"),
+        }
+
+    S = int(n_partitions)
+    if S % 2 != 0:
+        S -= 1
+    S = max(2, min(S, T))
+    parts = np.array_split(np.arange(T), S)
+    half = S // 2
+
+    lambdas: list[float] = []
+    for is_groups in itertools.combinations(range(S), half):
+        is_set = set(is_groups)
+        is_rows = np.concatenate([parts[g] for g in is_groups])
+        oos_rows = np.concatenate([parts[g] for g in range(S) if g not in is_set])
+
+        r_is = _column_sharpe(M[is_rows])
+        r_oos = _column_sharpe(M[oos_rows])
+        if not np.isfinite(r_is).any():
+            continue
+        n_star = int(np.nanargmax(r_is))
+        # OOS rank of the IS-best strategy: 1 (worst) … N (best).
+        ranks = np.argsort(np.argsort(r_oos)) + 1
+        omega = ranks[n_star] / (N + 1.0)
+        omega = min(max(omega, 1e-6), 1 - 1e-6)
+        lambdas.append(float(np.log(omega / (1.0 - omega))))
+
+    if not lambdas:
+        return {
+            "pbo": float("nan"), "n_strategies": int(N), "n_combinations": 0,
+            "lambda_mean": float("nan"), "lambda_median": float("nan"),
+        }
+    lam = np.asarray(lambdas)
+    return {
+        "pbo": float(np.mean(lam < 0.0)),
+        "n_strategies": int(N),
+        "n_combinations": int(lam.size),
+        "lambda_mean": float(lam.mean()),
+        "lambda_median": float(np.median(lam)),
+    }
+
+
+def expected_max_sharpe(sr_std: float, n_trials: int) -> float:
+    """Expected maximum Sharpe under the null of zero true skill.
+
+    Bailey & Lopez de Prado (2014): with ``n_trials`` independent strategies
+    whose Sharpe estimates have cross-sectional standard deviation ``sr_std``,
+    the expected maximum (in per-period units) is
+
+        ``sr_std · [ (1-γ)·Z⁻¹(1 - 1/N) + γ·Z⁻¹(1 - 1/(N·e)) ]``
+
+    where ``γ`` is the Euler-Mascheroni constant.  This is the benchmark a
+    candidate Sharpe must clear to be considered non-spurious.
+    """
+    if n_trials < 2 or not np.isfinite(sr_std) or sr_std <= 0:
+        return 0.0
+    g = EULER_MASCHERONI
+    z1 = float(stats.norm.ppf(1 - 1.0 / n_trials))
+    z2 = float(stats.norm.ppf(1 - 1.0 / (n_trials * np.e)))
+    return float(sr_std * ((1 - g) * z1 + g * z2))
+
+
+def deflated_sharpe(
+    sr_hat: float,
+    sr_std_trials: float,
+    n_trials: int,
+    skew: float,
+    kurtosis: float,
+    n_obs: int,
+) -> float:
+    """Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014).
+
+    The probability that the observed (per-period) Sharpe ``sr_hat`` exceeds
+    the expected-maximum benchmark :func:`expected_max_sharpe`, adjusting the
+    standard PSR for non-normal returns via ``skew`` and (non-excess)
+    ``kurtosis``.  Values > 0.95 indicate the result survives the multiple-
+    testing deflation implied by having tried ``n_trials`` configurations.
+
+    All Sharpe inputs must be in the **same per-period units** (not annualised).
+    """
+    sr0 = expected_max_sharpe(sr_std_trials, n_trials)
+    denom = 1.0 - skew * sr_hat + (kurtosis - 1.0) / 4.0 * sr_hat ** 2
+    denom = np.sqrt(max(denom, 1e-12))
+    num = (sr_hat - sr0) * np.sqrt(max(n_obs - 1, 1))
+    return float(stats.norm.cdf(num / denom))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -371,6 +508,27 @@ def run_cpcv_backtest(
     path_metrics = pd.DataFrame(rows).set_index("path")
 
     sharpes = path_metrics["sharpe"].to_numpy()
+
+    # ── Deflated Sharpe Ratio (Bailey & Lopez de Prado 2014) ─────────────────
+    # Treat the CPCV paths as the family of trials and ask whether the best
+    # path's Sharpe survives the multiple-testing deflation.  All Sharpe inputs
+    # are de-annualised to per-period units for the DSR formula.
+    sr_period = sharpes / np.sqrt(ANNUALISATION)
+    sr_period_finite = sr_period[np.isfinite(sr_period)]
+    pooled_returns = path_returns_arr[np.isfinite(path_returns_arr)]
+    path_lengths = np.sum(~np.isnan(path_returns_arr), axis=1)
+    if sr_period_finite.size >= 2 and pooled_returns.size > 10:
+        dsr = deflated_sharpe(
+            sr_hat=float(np.nanmax(sr_period_finite)),
+            sr_std_trials=float(np.nanstd(sr_period_finite, ddof=1)),
+            n_trials=int(sr_period_finite.size),
+            skew=float(stats.skew(pooled_returns)),
+            kurtosis=float(stats.kurtosis(pooled_returns, fisher=False)),
+            n_obs=int(np.median(path_lengths[path_lengths > 0])),
+        )
+    else:
+        dsr = float("nan")
+
     summary = {
         "n_paths": int(paths_pred.shape[0]),
         "n_combinations": int(n_combos),
@@ -382,7 +540,9 @@ def run_cpcv_backtest(
         "sharpe_median": float(np.nanmedian(sharpes)),
         "sharpe_p05": float(np.nanpercentile(sharpes, 5)),
         "sharpe_p95": float(np.nanpercentile(sharpes, 95)),
-        "pbo": _pbo_proxy(sharpes),
+        "sharpe_best": float(np.nanmax(sharpes)),
+        "pbo": _pbo_proxy(sharpes),  # single-model proxy: P(path Sharpe ≤ 0)
+        "deflated_sharpe": dsr,      # P(best-path Sharpe is non-spurious)
     }
 
     config_snapshot = {
@@ -412,6 +572,7 @@ def run_cpcv_backtest(
 
     logger.info(
         f"CPCV done: Sharpe mean={summary['sharpe_mean']:.3f} ± {summary['sharpe_std']:.3f}, "
-        f"PBO proxy={summary['pbo']:.2%}"
+        f"PBO proxy={summary['pbo']:.2%}, "
+        f"Deflated Sharpe={summary['deflated_sharpe']:.3f}"
     )
     return result

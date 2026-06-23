@@ -883,6 +883,39 @@ def main():
                                f"{cov95 * 100:.1f}%",
                                help="Should be ≈ 95%; far from 95% ⇒ PI mis-calibrated")
 
+                # ── Benchmark gate: is the model actually beating no-change? ──
+                st.markdown("---")
+                st.subheader("Benchmark Gate — vs No-Change Forecast")
+                st.markdown(
+                    "The oil-forecasting literature's core discipline: a model is "
+                    "only useful if it beats the random walk.  **MSPE ratio < 1** "
+                    "with a small **Diebold-Mariano** p-value means the point "
+                    "forecast genuinely beats no-change; **Pesaran-Timmermann** "
+                    "tests directional skill; **Berkowitz** tests whether the fan "
+                    "chart is calibrated (here a *large* p-value is good)."
+                )
+                gcols = st.columns(4)
+                gcols[0].metric(
+                    "MSPE ratio vs no-change",
+                    f"{scores.get('mspe_ratio', float('nan')):.4f}",
+                    help="< 1.0 ⇒ beats the random walk",
+                )
+                gcols[1].metric(
+                    "Diebold-Mariano p",
+                    f"{scores.get('dm_pvalue', float('nan')):.3f}",
+                    help="< 0.05 ⇒ accuracy gap vs no-change is significant",
+                )
+                gcols[2].metric(
+                    "Pesaran-Timmermann p",
+                    f"{scores.get('pt_pvalue', float('nan')):.3f}",
+                    help="< 0.05 ⇒ directional skill better than chance",
+                )
+                gcols[3].metric(
+                    "Berkowitz p (calibration)",
+                    f"{scores.get('berkowitz_pvalue_model', float('nan')):.3f}",
+                    help="> 0.05 ⇒ predictive density is calibrated (good)",
+                )
+
             # Concept-drift monitor (item 15)
             st.markdown("---")
             st.subheader("Concept-Drift Monitor")
@@ -950,6 +983,20 @@ def main():
                     "Above ~50% suggests the historical Sharpe is unlikely "
                     "to repeat OOS."
                 ),
+            )
+
+            dcols = st.columns(2)
+            _dsr = summary.get("deflated_sharpe", float("nan"))
+            dcols[0].metric(
+                "Deflated Sharpe", f"{_dsr:.3f}" if _dsr == _dsr else "n/a",
+                help=(
+                    "Bailey-Lopez de Prado: probability the best path's Sharpe is "
+                    "non-spurious after deflating for the number of paths tried. "
+                    "> 0.95 ⇒ survives the multiple-testing adjustment."
+                ),
+            )
+            dcols[1].metric(
+                "Best-path Sharpe", f"{summary.get('sharpe_best', float('nan')):.3f}",
             )
 
             if path_metrics is not None and len(path_metrics):

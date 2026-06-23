@@ -197,6 +197,23 @@ def main() -> None:
         for k, v in bt_result.scores.items():
             logger.info(f"  {k:30s} {v}")
 
+        # Density-weighted acceptance gate (Phase 0): the headline numbers a
+        # change must not worsen.  Lower CRPS/log-score is better; MSPE ratio
+        # < 1 beats no-change; small DM/PT p-values mean the edge is real;
+        # large Berkowitz p-value means the fan chart is calibrated.
+        s = bt_result.scores
+        logger.info(
+            "GATE | CRPS=%.5f log_score=%.4f | MSPE_ratio=%.4f (DM p=%.3f) | "
+            "dir_acc=%.3f (PT p=%.3f) | Berkowitz p=%.3f",
+            s.get("crps_mean_model", float("nan")),
+            s.get("log_score_mean_model", float("nan")),
+            s.get("mspe_ratio", float("nan")),
+            s.get("dm_pvalue", float("nan")),
+            s.get("directional_accuracy", float("nan")),
+            s.get("pt_pvalue", float("nan")),
+            s.get("berkowitz_pvalue_model", float("nan")),
+        )
+
         # Bates-Granger optimal naive combination weights
         logger.info("Computing Bates-Granger combination weights against naive baseline…")
         weights = fit_from_backtest(bt_result.path)

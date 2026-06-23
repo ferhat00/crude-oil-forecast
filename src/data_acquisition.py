@@ -440,6 +440,105 @@ def fetch_alpha_vantage_data(
     return df
 
 
+def fetch_gpr_data(
+    source: str,
+    save_path: Path | None = None,
+) -> pd.DataFrame:
+    """Fetch the daily Geopolitical Risk index (Caldara & Iacoviello 2022).
+
+    GPR is a newspaper-based measure available **daily since 1985** — one of
+    the very few oil fundamentals at the model's native frequency.  ``source``
+    is the URL (or local path) of Iacoviello's ``data_gpr_daily_recent.xls``
+    (or any Excel/CSV with a date column and a ``GPRD`` column).
+
+    Returns:
+        DataFrame indexed by date with a single ``gpr`` column (the daily
+        GPRD level).  Derived features (log level, trend, spike dummy) are
+        engineered downstream in :mod:`src.data_engineering`.
+    """
+    logger.info(f"Fetching daily GPR index from {source}")
+    if str(source).lower().endswith(".csv"):
+        raw = pd.read_csv(source)
+    else:
+        raw = pd.read_excel(source)
+
+    lower = {str(c).lower(): c for c in raw.columns}
+    date_col = lower.get("date") or lower.get("month") or list(raw.columns)[0]
+    gprd_col = None
+    for cand in ("gprd", "gprhd", "gpr"):
+        if cand in lower:
+            gprd_col = lower[cand]
+            break
+    if gprd_col is None:
+        raise ValueError(
+            f"No GPRD column found in GPR source (columns: {list(raw.columns)})"
+        )
+
+    df = pd.DataFrame({"gpr": pd.to_numeric(raw[gprd_col], errors="coerce")})
+    df.index = pd.to_datetime(raw[date_col], errors="coerce")
+    df.index.name = "date"
+    df = df[df.index.notna()].dropna().sort_index()
+    logger.info(f"  GPR: {len(df)} daily observations")
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(save_path)
+        logger.info(f"Saved GPR data to {save_path}")
+    return df
+
+
+def fetch_gecon_data(
+    source: str,
+    save_path: Path | None = None,
+) -> pd.DataFrame:
+    """Fetch the monthly GECON global economic conditions index (Baumeister et al.).
+
+    GECON (Baumeister, Korobilis & Lee 2022, REStat) is a monthly factor built
+    for energy markets — among the best global-activity predictors of the real
+    oil price.  ``source`` is the URL (or local path) of the dataset's Excel/CSV
+    file; the GECON column is auto-detected (a column whose name contains
+    ``gecon``, else the first numeric non-date column).
+
+    Returns:
+        DataFrame indexed by month with a single ``gecon`` column.
+    """
+    logger.info(f"Fetching monthly GECON index from {source}")
+    if str(source).lower().endswith(".csv"):
+        raw = pd.read_csv(source)
+    else:
+        raw = pd.read_excel(source)
+
+    lower = {str(c).lower(): c for c in raw.columns}
+    date_col = lower.get("date") or lower.get("month") or list(raw.columns)[0]
+    gecon_col = next((orig for low, orig in lower.items() if "gecon" in low), None)
+    if gecon_col is None:
+        # Fall back to the first numeric column that is not the date column.
+        for c in raw.columns:
+            if c == date_col:
+                continue
+            if pd.api.types.is_numeric_dtype(pd.to_numeric(raw[c], errors="coerce")):
+                gecon_col = c
+                break
+    if gecon_col is None:
+        raise ValueError(
+            f"No GECON column found in source (columns: {list(raw.columns)})"
+        )
+
+    df = pd.DataFrame({"gecon": pd.to_numeric(raw[gecon_col], errors="coerce")})
+    df.index = pd.to_datetime(raw[date_col], errors="coerce")
+    df.index.name = "date"
+    df = df[df.index.notna()].dropna().sort_index()
+    logger.info(f"  GECON: {len(df)} monthly observations")
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(save_path)
+        logger.info(f"Saved GECON data to {save_path}")
+    return df
+
+
 def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
     """Run all data acquisition steps.
 
@@ -486,6 +585,32 @@ def acquire_all(config: dict) -> dict[str, pd.DataFrame]:
                 result["cot"] = pd.read_parquet(cot_path)
             else:
                 raise
+
+    # Geopolitical Risk index (daily; fragile xls scraper — soft-fail/skip)
+    gpr_cfg = config.get("gpr", {})
+    if gpr_cfg.get("enabled", False) and gpr_cfg.get("url"):
+        gpr_path = raw_dir / "gpr.parquet"
+        try:
+            result["gpr"] = fetch_gpr_data(gpr_cfg["url"], save_path=gpr_path)
+        except Exception as exc:
+            if gpr_path.exists():
+                logger.warning(f"GPR fetch failed ({exc}); loading cached data from {gpr_path}")
+                result["gpr"] = pd.read_parquet(gpr_path)
+            else:
+                logger.warning(f"GPR fetch failed and no cache available: {exc}")
+
+    # GECON global economic conditions (monthly; fragile xlsx scraper)
+    gecon_cfg = config.get("gecon", {})
+    if gecon_cfg.get("enabled", False) and gecon_cfg.get("url"):
+        gecon_path = raw_dir / "gecon.parquet"
+        try:
+            result["gecon"] = fetch_gecon_data(gecon_cfg["url"], save_path=gecon_path)
+        except Exception as exc:
+            if gecon_path.exists():
+                logger.warning(f"GECON fetch failed ({exc}); loading cached data from {gecon_path}")
+                result["gecon"] = pd.read_parquet(gecon_path)
+            else:
+                logger.warning(f"GECON fetch failed and no cache available: {exc}")
 
     # Alpha Vantage economic indicators
     av_cfg = config.get("alpha_vantage", {})

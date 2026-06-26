@@ -9,20 +9,31 @@ data:
   start_date: "2015-01-01"
   end_date: null  # null means today
   oil_tickers:
-    - "CL=F"  # WTI crude (target)
+    - "CL=F"  # WTI crude
     - "BZ=F"  # Brent crude
   fred_series:
-    usd_index: "DTWEXBGS"       # Trade Weighted US Dollar Index: Broad, Goods
-    cpi: "CPIAUCSL"             # Consumer Price Index
-    fed_funds: "DFF"            # Federal Funds Effective Rate
-    t10y2y: "T10Y2Y"            # 10-Year minus 2-Year Treasury spread
+    usd_index:    "DTWEXBGS"       # Trade Weighted US Dollar Index: Broad, Goods
+    cpi:          "CPIAUCSL"       # Consumer Price Index (monthly, lagging)
+    fed_funds:    "DFF"            # Federal Funds Effective Rate
+    t10y2y:       "T10Y2Y"         # 10-Year minus 2-Year Treasury spread
+    # ── Oil-specific risk & forward inflation ─────────────────────────────────
+    ovx:          "OVXCLS"         # CBOE Crude Oil ETF Volatility Index (daily)
+    t5yie:        "T5YIE"          # 5-Year Breakeven Inflation Rate (daily)
+    t10yie:       "T10YIE"         # 10-Year Breakeven Inflation Rate (daily)
+    hy_spread:    "BAMLH0A0HYM2"  # ICE BofA US High Yield OAS (daily)
+    # ── Real-economy demand drivers ───────────────────────────────────────────
+    indpro:       "INDPRO"         # Industrial Production Index (monthly)
+    oil_prod_ip:  "IPG211111CN"    # Industrial Production: Crude Oil Extraction (monthly)
+    cap_util:     "TCU"            # Capacity Utilization: Total Index (monthly)
+    unemployment: "UNRATE"         # Unemployment Rate (monthly)
     # ── Financial conditions & systemic risk ──────────────────────────────
     nfci:         "NFCI"              # Chicago Fed National Financial Conditions Index (weekly)
     stlfsi:       "STLFSI4"           # St. Louis Fed Financial Stress Index (weekly)
-    epu_us:       "USEPUINDXD"        # US Economic Policy Uncertainty Index (daily)
+    epu_us:       "USEPUINDXD"        # US Economic Policy Uncertainty Index (daily; lagged 30d)
     epu_global:   "GEPUPPP"           # Global Economic Policy Uncertainty (monthly)
     # ── Real economy / demand ─────────────────────────────────────────────
     pmi_mfg:      "NAPM"              # ISM Manufacturing PMI (monthly)
+    igrea:        "IGREA"             # Kilian Index of Global Real Economic Activity (monthly)
     retail_gas:   "GASREGCOVW"        # US Regular Gasoline Retail Price (weekly, EIA via FRED)
     miles_driven: "M12MTVUSM227NFWA"  # Vehicle Miles Travelled (monthly)
     # ── Fed balance sheet / liquidity ─────────────────────────────────────
@@ -34,38 +45,57 @@ data:
   eia_series:
     crude_stocks:      "PET.WTTSTUS1.W"   # Weekly U.S. Ending Stocks of Crude Oil
     production:        "PET.WCRFPUS2.W"   # Weekly U.S. Crude Oil Production
-    gasoline_stocks:   "PET.WGFUPUS2.W"   # Weekly U.S. Gasoline Stocks
+    gasoline_stocks:   "PET.WGFUPUS2.W"   # Weekly U.S. Gasoline Product Supplied (demand proxy)
     distillate_stocks: "PET.WDISTUS1.W"   # Weekly U.S. Distillate Fuel Stocks
     crude_imports:     "PET.WCRRIUS2.W"   # Weekly U.S. Crude Oil Imports
     spr:               "PET.WCRSTUS1.W"   # Weekly U.S. Strategic Petroleum Reserve
+    # ── Supply-demand identity completers ──────────────────────────────────────
+    cushing_stocks:          "PET.W_EPC0_SAX_YCUOK_MBBL.W"  # Cushing OK stocks — WTI futures delivery point
+    refinery_utilization:    "PET.WPULEUS3.W"                 # U.S. refinery utilization % of operable capacity
+    crude_exports:           "PET.WCREXUS2.W"                 # U.S. crude oil exports (weekly, post-2015)
+    jet_fuel_demand:         "PET.WKJUPUS2.W"                 # Jet fuel product supplied — aviation demand proxy
+    total_products_supplied: "PET.WRPUPUS2.W"                 # Total petroleum products supplied — aggregate demand
     # ── Natural gas storage (inter-fuel competition signal) ──────────────────
-    # Note: US oil rig count (Baker Hughes) is not available via EIA API v2
-    nat_gas_stocks:    "NG.NW2_EPG0_SWO_R48_BCF.W"  # Natural gas storage lower-48 (BCF, weekly)
-
-  # ── Optional: per-series FRED publication-lag overrides (calendar days) ──
-  # Defaults in src/data_engineering.py FRED_PUBLICATION_LAG_DAYS are
-  # conservative upper bounds based on each agency's release calendar.
-  # Override here if you know a tighter publication schedule.  Pass {} to
-  # disable FRED shifting entirely.  Keys match the descriptive names under
-  # `fred_series:` above.
-  # fred_publication_lags:
-  #   unemployment: 38
-  #   cpi: 45
+    nat_gas_stocks:          "NG.NW2_EPG0_SWO_R48_BCF.W"     # Natural gas storage lower-48 (BCF, weekly)
+    # ── NYMEX WTI futures term structure (Contracts 1–4, daily) ──────────────
+    # Front-month vs deferred contracts → contango / backwardation, the single
+    # strongest fundamental signal in oil pricing.  CL=F (Yahoo) is the rolled
+    # front month only, so we pull the strip from EIA to compute spreads.
+    wti_m1:                  "PET.RCLC1.D"   # NYMEX WTI Contract 1 (front month) $/bbl
+    wti_m2:                  "PET.RCLC2.D"   # Contract 2 (1-month deferred)
+    wti_m3:                  "PET.RCLC3.D"   # Contract 3 (2-month deferred)
+    wti_m4:                  "PET.RCLC4.D"   # Contract 4 (3-month deferred)
 
 alpha_vantage:
   api_key: "YOUR_ALPHA_VANTAGE_API_KEY"  # https://www.alphavantage.co/support/#api-key
   base_url: "https://www.alphavantage.co/query"
   series:
     av_consumer_sentiment: "CONSUMER_SENTIMENT"  # University of Michigan Consumer Sentiment
-    av_nonfarm_payroll:   "NONFARM_PAYROLL"       # US Nonfarm Payrolls (demand proxy)
-    av_real_gdp:          "REAL_GDP"              # Quarterly real GDP growth (demand baseline)
-    av_wti_spot:          "WTI"                   # WTI crude spot price from AV (cross-check)
-    av_natural_gas:       "NATURAL_GAS"           # Henry Hub spot (monthly, cross-check)
-    av_copper:            "COPPER"                # LME copper price — industrial demand composite
-    av_global_cpi:        "CPI"                   # US CPI (monthly AV version)
+    av_nonfarm_payroll:    "NONFARM_PAYROLL"      # US Nonfarm Payrolls (employment demand proxy)
+    av_retail_sales:       "RETAIL_SALES"         # Advance Monthly Retail Sales (consumer spending → gasoline demand)
+    av_durables:           "DURABLES"             # Manufacturers' New Orders: Durable Goods (forward-looking industrial demand)
+    av_real_gdp:           "REAL_GDP"             # Quarterly real GDP growth (demand baseline)
+    av_wti_spot:           "WTI"                  # WTI crude spot price from AV (cross-check)
+    av_natural_gas:        "NATURAL_GAS"          # Henry Hub spot (monthly, cross-check)
+    av_copper:             "COPPER"               # LME copper price — industrial demand composite
+    av_global_cpi:         "CPI"                  # US CPI (monthly AV version)
 
 cot:
   enabled: true  # CFTC Commitments of Traders — WTI speculative positioning (no API key)
+
+# ── Geopolitical Risk index (Caldara & Iacoviello 2022) — daily, no API key ──
+# Fragile non-API xls scraper: on download failure the pipeline logs a warning
+# and continues without GPR features (cached parquet reused if present).
+gpr:
+  enabled: true
+  url: "https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.xls"
+
+# ── GECON global economic conditions (Baumeister, Korobilis & Lee 2022) ──────
+# Monthly xlsx; URL must point at a directly-downloadable file (the author's
+# site hosts it via Google Drive — set a working mirror/local path here).
+gecon:
+  enabled: false
+  url: ""
 
 market_tickers:
   # ── Currencies (USD vs oil-relevant economies) ──────────────────────────────
@@ -127,13 +157,13 @@ features:
   rsi_period: 14                    # RSI lookback period
   target: "CL=F_close"
   # ── Target transformation ────────────────────────────────────────────────
-  # 'level'      = predict raw price (legacy; lag_1 dominates because the
-  #                price series is near-random-walk, masking real signal).
-  # 'log_return' = predict log(P_{t+1}/P_t); price reconstructed on display.
-  #                Stationary target lets structural features carry weight.
+  # 'level' = predict raw price (legacy behaviour — near-random-walk → lag_1 dominates)
+  # 'log_return' = predict log(P_{t+1}/P_t); price is reconstructed for display.
+  # log_return makes the GAM's smooths fit a stationary signal and lets the
+  # structural features carry real predictive weight.
   target_transform: "log_return"
 
-  # ── MACD parameters (previously hardcoded 12/26/9) ──────────────────────
+  # ── MACD parameters ──────────────────────────────────────────────────────
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
@@ -144,6 +174,9 @@ features:
   stochastic_k_period: 14          # Stochastic %K
   stochastic_d_period: 3           # Stochastic %D (smoothed signal line)
   cmf_period: 20                   # Chaikin Money Flow — volume-weighted buying pressure
+
+  # ── Range-based realised volatility (Parkinson/GK/Rogers-Satchell/Yang-Zhang)
+  range_vol_windows: [5, 20, 60]   # Windows for the OHLC range-vol estimators
 
   # ── Rolling cross-asset correlations ────────────────────────────────────
   correlation_windows: [30, 90]    # Rolling corr of WTI vs each pair below
@@ -167,20 +200,17 @@ model:
   active_mode: fast                    # "fast" or "thorough"
 
   # ── Fast preset: fewer lambdas, soft hard cap, moderate steps/folds ──────
-  # Hard cap target_max_terms=30 gives n/k ≈ 25 on ~750 obs (rough floor
-  # for parametric stability).  λ floor of 0.1 keeps splines genuinely
-  # regularised — λ=0.01 with n_splines=25 was effectively unconstrained.
   fast:
     stepwise_selection: true
     stepwise_criterion: aic
-    stepwise_max_steps: 50
+    stepwise_max_steps: 30
     target_max_terms: 30
-    lam_search: [0.1, 1, 10, 100]
-    cv_splits: 3
+    lam_search: [1, 10, 100]
+    cv_splits: 2
     sigma_stepwise: true
-    sigma_max_terms: null
-    nu_max_terms: null
-    tau_max_terms: null
+    sigma_max_terms: 12
+    nu_max_terms: 8
+    tau_max_terms: 8
 
   # ── Thorough preset: full grid, hard cap, more steps/folds ───────────────
   thorough:
@@ -197,6 +227,60 @@ model:
 
   # ── Shared settings (apply to both presets, overridable per preset) ──────
   n_splines: 25
-  embargo_days: 200                    # Obs to drop between train/test boundary
+  embargo_days: 60                   # Obs to drop between train/test boundary
   n_jobs: -1                           # Parallel workers: -1 = all CPUs
   nu_tau_window: 60                    # Rolling window for skewness/kurtosis
+
+  # ── Predictive-scale source (Phase 1) ────────────────────────────────────
+  # 'gam'   = sigma-GAM on log|residual| (level-dependent only; default).
+  # 'garch' = GARCH(1,1)/EWMA conditional sigma (serial volatility clustering).
+  # 'blend' = 50/50 variance blend of the two.  Gated on CRPS/log-score/
+  #           Berkowitz in the walk-forward backtest before flipping default.
+  sigma_source: gam
+
+  # ── Forecast-quality knobs ───────────────────────────────────────────────
+  # Drop one feature from any pair with |Pearson ρ| above this threshold,
+  # before stepwise BIC.  Set to 1.0 to disable.
+  collinearity_threshold: 0.97
+  # Pre-transform skewed features via empirical CDF so pyGAM's evenly-spaced
+  # knots correspond to quantile-spaced knots in the original space.
+  quantile_knots: true
+  # Apply domain-driven monotonicity constraints (inventories↓price etc.)
+  # to spline terms whose names match MONOTONIC_CONSTRAINTS in src/model.py.
+  enable_monotonic: true
+  # Add tensor-product te(i,j) interaction terms for the whitelist in
+  # DEFAULT_INTERACTION_PAIRS (DXY×inventories, VIX×OVX, RSI×ATR, etc.).
+  enable_interactions: true
+  interaction_n_splines: 6
+  interaction_lam: 10.0
+  # Number of poor-man's GAMLSS iterations (re-fit μ with weights = 1/σ̂²).
+  # Set 0 to disable.  1–2 typically converges; more is rarely useful.
+  iterative_refits: 1
+  # Bagged ensemble around μ (stationary bootstrap).
+  bagging:
+    enabled: true
+    n_bags: 5
+    block_length: 21
+    random_state: 0
+    n_jobs: 1
+  # Direct quantile/expectile training in addition to the Gaussian + Johnson
+  # SU pipeline.  Used by the dashboard to compare PI sources.
+  expectile_levels: [0.05, 0.50, 0.95]
+  # Split-conformal coverage target for distribution-free PI calibration.
+  conformal_alpha: 0.10
+
+# ── Walk-forward backtest (Step 6) ─────────────────────────────────────────
+# Quarterly refit (63 trading days); test_period kept equal to refit_period for
+# a continuous out-of-sample path.  Defaults if this section is absent: 21 / 21.
+backtest:
+  refit_period_days: 63
+  test_period_days: 63
+
+# ── Combinatorial Purged Cross-Validation backtest (Ch. 12) ────────────────
+# Enable from the CLI with `python scripts/run_pipeline.py --cpcv` or here.
+# Produces a distribution of backtest paths in outputs/backtests/cpcv/.
+cpcv:
+  enabled: true
+  n_splits: 4        # C(4,2)=6 combinations
+  n_test_splits: 2   # k — groups per test combination (book example: 2)
+  pct_embargo: 0.01  # Fraction of total observations to embargo per fold

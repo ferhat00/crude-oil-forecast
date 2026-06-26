@@ -99,16 +99,16 @@ class TestClassifyFeature:
 
 class TestBuildFeatureMatrix:
     def test_excludes_target(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert "CL=F_close" not in names
 
     def test_excludes_raw_ohlcv(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert "CL=F_open" not in names
         assert "CL=F_volume" not in names
 
     def test_output_shapes(self, sample_feature_df, sample_config):
-        X, y, names, target_dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, target_dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         # Default horizon=1 drops the last row (target unknown)
         assert X.shape[0] == len(sample_feature_df) - 1
         assert X.shape[1] == len(names)
@@ -116,7 +116,7 @@ class TestBuildFeatureMatrix:
         assert len(target_dates) == X.shape[0]
 
     def test_output_shapes_horizon_zero(self, sample_feature_df, sample_config):
-        X, y, names, target_dates = build_feature_matrix(
+        X, y, names, target_dates, _t1 = build_feature_matrix(
             sample_feature_df, "CL=F_close", forecast_horizon=0
         )
         assert X.shape[0] == len(sample_feature_df)
@@ -124,27 +124,27 @@ class TestBuildFeatureMatrix:
         assert len(target_dates) == len(sample_feature_df)
 
     def test_target_dates_shifted(self, sample_feature_df, sample_config):
-        X, y, names, target_dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, target_dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         # target_dates should be the actual next trading day from the index
         assert target_dates[0] == sample_feature_df.index[1]
         assert target_dates[-1] == sample_feature_df.index[-1]
 
     def test_feature_names_list(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         assert isinstance(names, list)
         assert all(isinstance(n, str) for n in names)
 
 
 class TestDefineGamTerms:
     def test_returns_terms_object(self, sample_feature_df, sample_config):
-        _, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
+        _, _, names, _, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         assert terms is not None
 
 
 class TestFitGam:
     def test_fit_on_synthetic_data(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         predictions = gam.predict(X)
@@ -154,7 +154,7 @@ class TestFitGam:
 
 class TestCrossValidate:
     def test_cv_returns_correct_structure(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         results = cross_validate(X, y, terms, n_splits=3, embargo_days=5, lam_values=[0.1, 1])
 
@@ -169,7 +169,7 @@ class TestCrossValidate:
 
 class TestComputeBic:
     def test_bic_greater_than_aic_for_large_n(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         bic = compute_bic(gam, len(y))
@@ -178,7 +178,7 @@ class TestComputeBic:
         assert bic >= aic
 
     def test_bic_returns_float(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[1])
         assert isinstance(compute_bic(gam, len(y)), float)
@@ -186,7 +186,7 @@ class TestComputeBic:
 
 class TestStepwiseBIC:
     def test_bic_stepwise_reduces_features(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         n_orig = len(names)
         X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
             X, y, names, sample_config,
@@ -199,7 +199,7 @@ class TestStepwiseBIC:
         assert X_sel.shape[1] == len(sel_names)
 
     def test_aic_stepwise_still_works(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_sel, sel_idx, sel_names, dropped, gam = stepwise_aic_selection(
             X, y, names, sample_config,
             lam_values=[0.1, 1],
@@ -211,7 +211,7 @@ class TestStepwiseBIC:
 
 class TestSigmaModel:
     def test_select_sigma_features(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_sig, sig_names, indices = select_sigma_features(names, X)
         # At least _std_ should match CL=F_close_std_14
         assert len(sig_names) >= 1
@@ -219,7 +219,7 @@ class TestSigmaModel:
         assert all(n in names for n in sig_names)
 
     def test_fit_sigma_gam(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         terms = define_gam_terms(names, sample_config)
         gam = fit_gam(X, y, terms, lam_values=[0.1, 1])
         residuals = y - gam.predict(X)
@@ -246,7 +246,7 @@ class TestNuTauModels:
         assert np.all(tau_vals > 0)
 
     def test_select_nu_tau_features_fallback(self, sample_feature_df, sample_config):
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         # sample_feature_df has no ovx/vix/hy_spread — should fallback gracefully
         X_nt, nt_names, indices = select_nu_tau_features(names, X)
         assert X_nt.shape[0] == X.shape[0]
@@ -254,7 +254,7 @@ class TestNuTauModels:
 
     def test_fit_distributional_gam(self, sample_feature_df, sample_config):
         rng = np.random.default_rng(1)
-        X, y, names, _dates = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, y, names, _dates, _t1 = build_feature_matrix(sample_feature_df, "CL=F_close")
         X_nt, nt_names, _ = select_nu_tau_features(names, X)
         std_res = rng.standard_normal(len(y))
         valid_mask, rolling_nu, _ = compute_rolling_nu_tau(std_res, window=30)
@@ -271,7 +271,7 @@ class TestLogReturnTarget:
     """Item 1: build_feature_matrix with target_transform='log_return'."""
 
     def test_log_return_target_y_in_return_space(self, sample_feature_df):
-        X, y, names, dates = build_feature_matrix(
+        X, y, names, dates, _t1 = build_feature_matrix(
             sample_feature_df, "CL=F_close", target_transform="log_return",
         )
         # log-returns of a near-random walk should be O(1e-2) — not in the 60-80 range
@@ -282,10 +282,10 @@ class TestLogReturnTarget:
         np.testing.assert_almost_equal(y[0], expected_y0, decimal=10)
 
     def test_log_return_drops_level_lag_features(self, sample_feature_df):
-        X_lvl, _, names_lvl, _ = build_feature_matrix(
+        X_lvl, _, names_lvl, _, _ = build_feature_matrix(
             sample_feature_df, "CL=F_close", target_transform="level",
         )
-        X_ret, _, names_ret, _ = build_feature_matrix(
+        X_ret, _, names_ret, _, _ = build_feature_matrix(
             sample_feature_df, "CL=F_close", target_transform="log_return",
         )
         # Level-mode keeps the lag features; log-return mode drops them
@@ -303,7 +303,7 @@ class TestLogReturnTarget:
         np.testing.assert_array_equal(y_level, prices[1:])
 
     def test_reconstruct_price_round_trip(self, sample_feature_df):
-        _, y_ret, _, _ = build_feature_matrix(
+        _, y_ret, _, _, _ = build_feature_matrix(
             sample_feature_df, "CL=F_close", target_transform="log_return",
         )
         anchor = compute_anchor_prices(sample_feature_df, "CL=F_close", forecast_horizon=1)
@@ -335,13 +335,13 @@ class TestSkewedFeaturePatterns:
 
 class TestSkewedFeatureTransformer:
     def test_transform_round_shape(self, sample_feature_df):
-        X, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, _, names, _, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
         t = SkewedFeatureTransformer(names).fit(X)
         Xt = t.transform(X)
         assert Xt.shape == X.shape
 
     def test_skewed_columns_become_uniform(self, sample_feature_df):
-        X, _, names, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
+        X, _, names, _, _ = build_feature_matrix(sample_feature_df, "CL=F_close")
         t = SkewedFeatureTransformer(names).fit(X)
         Xt = t.transform(X)
         # Pick a skewed column (pct_change in our fixture)
@@ -544,3 +544,111 @@ class TestResolveModelConfig:
         assert resolved["n_splines"] == 25
         assert resolved["embargo_days"] == 200
         assert resolved["sigma_max_terms"] == 12
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Purged + embargoed CV (Chapter 7) — src.cv.PurgedKFold
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _synthetic_t1(n: int, horizon: int) -> tuple[np.ndarray, pd.Series]:
+    """Build an (X, t1) pair where row i's label resolves at row i+horizon."""
+    dates = pd.date_range("2020-01-01", periods=n, freq="B")
+    feature_dates = dates[: n - horizon] if horizon > 0 else dates
+    label_dates = dates[horizon:] if horizon > 0 else dates
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((len(feature_dates), 2))
+    t1 = pd.Series(label_dates, index=feature_dates, name="t1")
+    return X, t1
+
+
+class TestPurgedKFold:
+    def test_h1_no_embargo_matches_uniform_partition(self):
+        """For horizon=1 and pct_embargo=0, the test folds are contiguous and
+        cover the full sample exactly once — the basic KFold property the
+        legacy splitter only approximated after embargo."""
+        from src.cv import PurgedKFold
+
+        X, t1 = _synthetic_t1(n=100, horizon=1)
+        cv = PurgedKFold(n_splits=5, t1=t1, pct_embargo=0.0)
+        test_chunks = [te for _tr, te in cv.split(X)]
+        assert len(test_chunks) == 5
+        combined = np.concatenate(test_chunks)
+        np.testing.assert_array_equal(combined, np.arange(len(X)))
+
+    def test_h5_purges_overlapping_labels(self):
+        """With h=5, training rows whose t1 lies inside the test span must be
+        purged.  The first test row at position p has feature-date t1.index[p];
+        any train row with t1 >= that date must be dropped."""
+        from src.cv import PurgedKFold
+
+        X, t1 = _synthetic_t1(n=100, horizon=5)
+        cv = PurgedKFold(n_splits=5, t1=t1, pct_embargo=0.0)
+        for train_idx, test_idx in cv.split(X):
+            test_t0 = t1.index[int(test_idx.min())]
+            train_t1 = t1.iloc[train_idx]
+            # Either label fully resolved before test starts, OR row sits
+            # after the test region entirely.
+            assert (
+                (train_t1 < test_t0) | (train_idx >= int(test_idx.max()) + 1)
+            ).all(), "PurgedKFold leaked label-overlapping training rows."
+
+    def test_bilateral_embargo_drops_post_test_rows(self):
+        """Rows immediately after each test fold (within the embargo window)
+        must be excluded from training — the embargo is *bilateral* in the
+        canonical algorithm."""
+        from src.cv import PurgedKFold
+
+        X, t1 = _synthetic_t1(n=100, horizon=1)
+        cv = PurgedKFold(n_splits=4, t1=t1, pct_embargo=0.05)  # 5 obs embargo
+        embargo = int(len(X) * 0.05)
+        for train_idx, test_idx in cv.split(X):
+            test_end = int(test_idx.max())
+            # No training rows in (test_end, test_end + embargo].
+            forbidden = set(range(test_end + 1, test_end + 1 + embargo))
+            assert not (set(train_idx.tolist()) & forbidden), (
+                "Embargo zone not respected: train_idx overlaps post-test embargo."
+            )
+
+    def test_raises_on_misaligned_t1(self):
+        from src.cv import PurgedKFold
+
+        X, t1 = _synthetic_t1(n=100, horizon=1)
+        cv = PurgedKFold(n_splits=3, t1=t1.iloc[:-5], pct_embargo=0.0)
+        with pytest.raises(ValueError, match="aligned"):
+            list(cv.split(X))
+
+    def test_raises_when_t1_missing(self):
+        from src.cv import PurgedKFold
+
+        with pytest.raises(ValueError, match="t1"):
+            PurgedKFold(n_splits=3, t1=None)
+
+
+class TestEmbargoedTimeSeriesSplitT1Wrapper:
+    def test_delegates_to_purged_when_t1_passed(self):
+        """The wrapper must use the new purged algorithm when given t1, so
+        existing tests will exercise the canonical code path once t1 is
+        threaded through."""
+        from src.model import EmbargoedTimeSeriesSplit
+
+        X, t1 = _synthetic_t1(n=200, horizon=1)
+        splitter = EmbargoedTimeSeriesSplit(n_splits=4, embargo_days=10, t1=t1)
+        folds = list(splitter.split(X))
+        # PurgedKFold yields n_splits contiguous test folds covering the sample.
+        assert len(folds) == 4
+        combined = np.concatenate([te for _tr, te in folds])
+        np.testing.assert_array_equal(np.sort(combined), np.arange(len(X)))
+
+    def test_legacy_mode_when_t1_absent(self):
+        """Without t1, the wrapper must reproduce the original one-sided
+        embargo behaviour for backward compatibility."""
+        from src.model import EmbargoedTimeSeriesSplit
+
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((100, 3))
+        splitter = EmbargoedTimeSeriesSplit(n_splits=4, embargo_days=5)
+        folds = list(splitter.split(X))
+        # Each test fold should start strictly after train_end + embargo_days.
+        for train_idx, test_idx in folds:
+            assert test_idx.min() > train_idx.max() + 5

@@ -41,7 +41,10 @@ import pandas as pd
 from src.config_loader import get_project_root, resolve_model_config
 from src.evaluation import (
     PredictiveDistribution,
+    berkowitz_lr,
+    compute_benchmark_tests,
     compute_metrics,
+    compute_pit,
     compute_probabilistic_scores,
     directional_accuracy,
     fit_residual_distribution,
@@ -60,6 +63,7 @@ from src.model import (
     reconstruct_price_from_returns,
     stepwise_aic_selection,
 )
+from src.volatility import garch_conditional_sigma
 
 logger = logging.getLogger(__name__)
 
@@ -141,11 +145,12 @@ def run_walk_forward_backtest(
     n_jobs = model_cfg.get("n_jobs", 1)
     quantile_knots = bool(model_cfg.get("quantile_knots", False))
     corr_threshold = float(model_cfg.get("collinearity_threshold", 0.97))
+    sigma_source = str(model_cfg.get("sigma_source", "gam")).lower()
 
     if df is None:
         df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
 
-    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+    X_full, y_model, all_feature_names, target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     anchor = compute_anchor_prices(df, target, forecast_horizon=1)
@@ -284,6 +289,23 @@ def run_walk_forward_backtest(
         y_pred_model = gam.predict(X_test_sel)
         sigma_test = get_prediction_sigma(gam, X_test_sel)
 
+        # Serial-volatility scale (Phase 1): replace/blend the GAM PI sigma with
+        # a causal GARCH(1,1)/EWMA conditional σ filtered from PAST out-of-sample
+        # residuals only — leakage-safe, since the accumulators below are
+        # appended after each fold is scored.  Held flat across the test block
+        # (the one-step-ahead conditional-vol forecast).
+        if sigma_source != "gam" and len(oos_y_true_model) >= 150:
+            past_resid = (
+                np.asarray(oos_y_true_model, dtype=np.float64)
+                - np.asarray(oos_y_pred_model, dtype=np.float64)
+            )
+            vol_sigma = garch_conditional_sigma(past_resid).forecast
+            if np.isfinite(vol_sigma) and vol_sigma > 0:
+                if sigma_source == "garch":
+                    sigma_test = np.full_like(sigma_test, vol_sigma)
+                elif sigma_source == "blend":
+                    sigma_test = np.sqrt(0.5 * sigma_test ** 2 + 0.5 * vol_sigma ** 2)
+
         # Reconstruct to price scale
         if target_transform == "log_return":
             y_pred_price = anchor_test * np.exp(y_pred_model)
@@ -353,6 +375,18 @@ def run_walk_forward_backtest(
     scores["skill_mae"] = 1.0 - scores["mae_price"] / scores["mae_naive"] if scores["mae_naive"] else float("nan")
     scores["skill_rmse"] = 1.0 - scores["rmse_price"] / scores["rmse_naive"] if scores["rmse_naive"] else float("nan")
 
+    # Benchmark-relative inference (price scale): MSPE ratio vs the no-change
+    # forecast with Diebold-Mariano (HLN) significance, plus Pesaran-Timmermann
+    # directional skill.  This is the oil-forecasting literature's core test —
+    # "beats the random walk" is the bar every model must clear.
+    bench = compute_benchmark_tests(
+        path["y_true"].values,
+        path["y_pred"].values,
+        path["y_anchor"].values,        # no-change benchmark
+        anchor=path["y_anchor"].values,  # prior close → directional moves
+    )
+    scores.update(bench)
+
     # Coverage (price scale, from the recorded bands)
     for w in (50, 80, 90, 95):
         lo = path[f"lower_{w}"].values
@@ -391,6 +425,16 @@ def run_walk_forward_backtest(
             n_crps_samples=bt_cfg["n_crps_samples"],
         )
         scores.update({f"{k}_model": v for k, v in prob_scores.items()})
+
+        # Berkowitz LR calibration test on the model-space PIT — more powerful
+        # in small samples than the KS test inside compute_probabilistic_scores.
+        pit_model = compute_pit(
+            y_true_model, path["y_pred_model"].values,
+            path["sigma_model"].values, dist_global,
+        )
+        bk_lr, bk_p = berkowitz_lr(pit_model)
+        scores["berkowitz_lr_model"] = bk_lr
+        scores["berkowitz_pvalue_model"] = bk_p
     except Exception as exc:
         logger.warning(f"Backtest probabilistic scoring failed: {exc}")
 

@@ -10,7 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy import stats
+from scipy import optimize, stats
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
@@ -502,6 +502,376 @@ def compute_probabilistic_scores(
     ks_stat, ks_p = stats.kstest(pit, "uniform")
     out["pit_uniformity_pvalue"] = float(ks_p)
     return out
+
+
+# ─────────────────────────────────────────────
+# Phase 0: Benchmark-relative inference
+# ─────────────────────────────────────────────
+#
+# The oil-forecasting literature judges every model by its loss *ratio against
+# the no-change (random-walk) forecast*, with a significance test — not by raw
+# RMSE.  The functions below add that discipline:
+#   * Diebold-Mariano (1995) with the Harvey-Leybourne-Newbold (1997) small-
+#     sample correction — equal predictive accuracy of two forecasts.
+#   * Pesaran-Timmermann (1992) — directional accuracy better than chance.
+#   * MSPE ratio vs no-change — the field's headline number.
+#   * Berkowitz (2001) LR — density-forecast calibration (more powerful in
+#     small samples than the Kolmogorov-Smirnov check used above).
+
+
+def diebold_mariano(
+    loss_a: np.ndarray,
+    loss_b: np.ndarray,
+    h: int = 1,
+    harvey_correction: bool = True,
+) -> tuple[float, float]:
+    """Diebold-Mariano test of equal predictive accuracy (HLN-corrected).
+
+    Tests H0: ``E[loss_a - loss_b] = 0`` against a two-sided alternative.
+    The loss differential ``d_t = loss_a_t - loss_b_t`` is averaged and scaled
+    by a long-run variance estimate using autocovariances up to lag ``h-1``
+    (the Diebold-Mariano correction for ``h``-step-ahead forecast errors).
+
+    With ``harvey_correction`` the statistic is multiplied by the HLN small-
+    sample factor and compared to a Student-t distribution with ``n-1`` df,
+    which controls size far better than the asymptotic Normal at the sample
+    sizes seen in daily backtests.
+
+    Sign convention: a **negative** statistic means ``loss_a < loss_b`` on
+    average — i.e. forecast A (the model) is more accurate than forecast B
+    (typically the no-change benchmark).
+
+    Args:
+        loss_a: Per-observation loss of forecast A (e.g. squared errors).
+        loss_b: Per-observation loss of forecast B (the benchmark).
+        h: Forecast horizon in steps (1 for one-day-ahead).
+        harvey_correction: Apply the HLN finite-sample correction + t-dist.
+
+    Returns:
+        ``(dm_stat, p_value)``.  ``p_value`` is two-sided.  Returns
+        ``(nan, nan)`` when fewer than 8 paired finite observations remain.
+    """
+    d = np.asarray(loss_a, dtype=np.float64) - np.asarray(loss_b, dtype=np.float64)
+    d = d[np.isfinite(d)]
+    n = d.size
+    if n < 8:
+        return float("nan"), float("nan")
+
+    d_bar = float(d.mean())
+    # Long-run variance: gamma_0 + 2 * sum_{k=1}^{h-1} gamma_k  (Newey-West-style,
+    # rectangular weights as in the original DM derivation).
+    d_demeaned = d - d_bar
+    gamma_0 = float(np.mean(d_demeaned ** 2))
+    lrv = gamma_0
+    for k in range(1, h):
+        if k >= n:
+            break
+        gamma_k = float(np.mean(d_demeaned[k:] * d_demeaned[:-k]))
+        lrv += 2.0 * gamma_k
+    # Guard against a non-positive variance estimate (can happen for tiny n).
+    var_d_bar = lrv / n
+    if not np.isfinite(var_d_bar) or var_d_bar <= 0:
+        return float("nan"), float("nan")
+
+    dm = d_bar / np.sqrt(var_d_bar)
+
+    if harvey_correction:
+        # HLN (1997) scaling factor.
+        factor = (n + 1 - 2 * h + h * (h - 1) / n) / n
+        factor = max(factor, 1e-12)
+        dm = dm * np.sqrt(factor)
+        p_value = 2.0 * float(stats.t.cdf(-abs(dm), df=n - 1))
+    else:
+        p_value = 2.0 * float(stats.norm.cdf(-abs(dm)))
+
+    return float(dm), p_value
+
+
+def mspe_ratio(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_naive: np.ndarray,
+) -> float:
+    """Mean-squared prediction-error ratio of a model vs the no-change forecast.
+
+    ``MSPE(model) / MSPE(no-change)``.  Values **below 1** mean the model beats
+    the random walk; the oil literature's headline statistic.  NaNs in any of
+    the three series are dropped pairwise.
+    """
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    yn = np.asarray(y_naive, dtype=np.float64)
+    mask = np.isfinite(yt) & np.isfinite(yp) & np.isfinite(yn)
+    if mask.sum() < 2:
+        return float("nan")
+    mspe_model = float(np.mean((yt[mask] - yp[mask]) ** 2))
+    mspe_naive = float(np.mean((yt[mask] - yn[mask]) ** 2))
+    if mspe_naive <= 0:
+        return float("nan")
+    return mspe_model / mspe_naive
+
+
+def pesaran_timmermann(
+    actual_change: np.ndarray,
+    pred_change: np.ndarray,
+) -> tuple[float, float]:
+    """Pesaran-Timmermann (1992) test of directional (sign) predictability.
+
+    Tests whether the *sign* of the predicted move is independent of the sign
+    of the realised move (H0: no directional skill).  Inputs are the predicted
+    and realised changes (e.g. ``y_pred - anchor`` and ``y_true - anchor``);
+    only their signs are used.
+
+    Returns:
+        ``(pt_stat, p_value)`` where ``pt_stat`` is asymptotically N(0,1) and
+        the p-value is one-sided (H1: positive association — genuine skill).
+        ``(nan, nan)`` if fewer than 8 usable observations.
+    """
+    a = np.asarray(actual_change, dtype=np.float64)
+    p = np.asarray(pred_change, dtype=np.float64)
+    mask = np.isfinite(a) & np.isfinite(p)
+    a, p = a[mask], p[mask]
+    n = a.size
+    if n < 8:
+        return float("nan"), float("nan")
+
+    # Direction indicators (treat zero change as "up" — rare for prices).
+    yz = (a > 0).astype(np.float64)
+    xz = (p > 0).astype(np.float64)
+
+    p_hat = float(np.mean(yz == xz))           # success rate
+    py = float(np.mean(yz))                      # P(actual up)
+    px = float(np.mean(xz))                      # P(predicted up)
+    p_star = py * px + (1 - py) * (1 - px)       # success rate under independence
+
+    var_p = p_star * (1 - p_star) / n
+    var_pstar = (
+        ((2 * py - 1) ** 2) * px * (1 - px) / n
+        + ((2 * px - 1) ** 2) * py * (1 - py) / n
+        + 4 * py * px * (1 - py) * (1 - px) / (n ** 2)
+    )
+    denom = var_p - var_pstar
+    if not np.isfinite(denom) or denom <= 0:
+        return float("nan"), float("nan")
+
+    pt = (p_hat - p_star) / np.sqrt(denom)
+    p_value = float(stats.norm.sf(pt))           # one-sided (skill ⇒ large positive)
+    return float(pt), p_value
+
+
+def _berkowitz_negloglik(params: np.ndarray, z: np.ndarray) -> float:
+    """Negative exact AR(1) Gaussian log-likelihood for the Berkowitz test."""
+    mu, rho, log_sigma = params
+    sigma2 = np.exp(2.0 * log_sigma)
+    if abs(rho) >= 0.9999:
+        return 1e12
+    n = z.size
+    # Stationary marginal for the first observation.
+    var1 = sigma2 / (1.0 - rho ** 2)
+    mean1 = mu / (1.0 - rho)
+    ll = -0.5 * (np.log(2 * np.pi * var1) + (z[0] - mean1) ** 2 / var1)
+    # Conditional densities for t = 2..n.
+    resid = z[1:] - mu - rho * z[:-1]
+    ll += np.sum(-0.5 * (np.log(2 * np.pi * sigma2) + resid ** 2 / sigma2))
+    return -float(ll)
+
+
+def berkowitz_lr(pit: np.ndarray) -> tuple[float, float]:
+    """Berkowitz (2001) likelihood-ratio test of density-forecast calibration.
+
+    Transforms PIT values to ``z = Phi^{-1}(PIT)``; under a correctly specified
+    predictive distribution the ``z`` are i.i.d. standard normal.  Fits an
+    AR(1) with free mean, autocorrelation and variance, and tests the joint
+    restriction ``mu=0, rho=0, sigma^2=1`` via a likelihood ratio that is
+    asymptotically ``chi^2(3)``.  More powerful in small samples than KS.
+
+    Returns:
+        ``(lr_stat, p_value)``; ``(nan, nan)`` if fewer than 12 finite PITs.
+    """
+    pit = np.asarray(pit, dtype=np.float64)
+    pit = pit[np.isfinite(pit)]
+    if pit.size < 12:
+        return float("nan"), float("nan")
+
+    # Clip away from 0/1 so the inverse-normal transform stays finite.
+    eps = 1e-6
+    z = stats.norm.ppf(np.clip(pit, eps, 1 - eps))
+
+    # Restricted log-likelihood: standard normal i.i.d.
+    ll_restricted = float(np.sum(stats.norm.logpdf(z)))
+
+    # Unrestricted: MLE of (mu, rho, log sigma).  Start from OLS AR(1).
+    z_lag, z_cur = z[:-1], z[1:]
+    rho0 = float(np.corrcoef(z_lag, z_cur)[0, 1]) if z.size > 2 else 0.0
+    rho0 = np.clip(rho0, -0.95, 0.95)
+    mu0 = float(np.mean(z) * (1 - rho0))
+    sigma0 = float(np.std(z - np.mean(z))) or 1.0
+    x0 = np.array([mu0, rho0, np.log(max(sigma0, 1e-3))])
+
+    try:
+        res = optimize.minimize(
+            _berkowitz_negloglik, x0, args=(z,), method="Nelder-Mead",
+            options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 2000},
+        )
+        ll_unrestricted = -float(res.fun)
+    except Exception:
+        return float("nan"), float("nan")
+
+    lr = 2.0 * (ll_unrestricted - ll_restricted)
+    lr = max(lr, 0.0)  # numerical guard
+    p_value = float(stats.chi2.sf(lr, df=3))
+    return float(lr), p_value
+
+
+def compute_benchmark_tests(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_naive: np.ndarray,
+    anchor: np.ndarray | None = None,
+    pit: np.ndarray | None = None,
+    h: int = 1,
+) -> dict[str, float]:
+    """Bundle the benchmark-relative tests into one dict for the score tables.
+
+    Args:
+        y_true: Realised values (price scale recommended for the MSPE ratio).
+        y_pred: Model point forecasts (same scale as ``y_true``).
+        y_naive: No-change / random-walk forecasts (same scale).
+        anchor: Prior-period value used to form directional moves for the
+            Pesaran-Timmermann test.  When None the PT test is skipped.
+        pit: Probability-integral-transform values for the Berkowitz test.
+            When None the calibration test is skipped.
+        h: Forecast horizon (steps) for the DM long-run variance.
+
+    Returns:
+        Dict with ``mspe_ratio``, ``dm_stat``/``dm_pvalue`` (model vs naive,
+        squared-error loss), and — when the corresponding inputs are given —
+        ``pt_stat``/``pt_pvalue`` and ``berkowitz_lr``/``berkowitz_pvalue``.
+    """
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    yn = np.asarray(y_naive, dtype=np.float64)
+
+    out: dict[str, float] = {}
+    out["mspe_ratio"] = mspe_ratio(yt, yp, yn)
+    dm_stat, dm_p = diebold_mariano((yt - yp) ** 2, (yt - yn) ** 2, h=h)
+    out["dm_stat"] = dm_stat
+    out["dm_pvalue"] = dm_p
+
+    if anchor is not None:
+        anc = np.asarray(anchor, dtype=np.float64)
+        pt_stat, pt_p = pesaran_timmermann(yt - anc, yp - anc)
+        out["pt_stat"] = pt_stat
+        out["pt_pvalue"] = pt_p
+
+    if pit is not None:
+        bk_lr, bk_p = berkowitz_lr(pit)
+        out["berkowitz_lr"] = bk_lr
+        out["berkowitz_pvalue"] = bk_p
+
+    return out
+
+
+# ─────────────────────────────────────────────
+# Phase 0: Multiple-model comparison (data-snooping controls)
+# ─────────────────────────────────────────────
+#
+# Once several challenger models exist (Phase 3 EBM, Phase 5 boosters) pairwise
+# DM tests suffer multiplicity.  These thin wrappers over the reference `arch`
+# implementations give the Model Confidence Set (Hansen-Lunde-Nason 2011) — the
+# set of models statistically indistinguishable from the best — and the SPA /
+# Reality-Check test (Hansen 2005; White 2000) for whether ANY challenger beats
+# a benchmark after accounting for the whole search.  `arch` is imported lazily
+# so this module stays importable without it.
+
+
+def model_confidence_set(
+    losses,
+    alpha: float = 0.10,
+    n_bootstrap: int = 1000,
+    block_size: int | None = None,
+    seed: int = 0,
+) -> dict:
+    """Hansen-Lunde-Nason Model Confidence Set over per-observation losses.
+
+    Args:
+        losses: ``(T × N)`` DataFrame / 2D array of per-observation losses,
+            one column per model (lower = better).
+        alpha: MCS test size (the returned set has ≥ ``1-alpha`` coverage).
+        n_bootstrap: Stationary-bootstrap replications.
+        block_size: Mean block length; defaults to ``T**(1/3)``.
+        seed: Bootstrap seed for reproducibility.
+
+    Returns:
+        Dict with ``included`` / ``excluded`` model labels and per-model
+        ``pvalues``.  Degenerate inputs (< 2 models or < 10 rows) return all
+        models as included with an explanatory ``note``.
+    """
+    L = pd.DataFrame(losses).dropna()
+    if L.shape[1] < 2 or L.shape[0] < 10:
+        return {
+            "included": list(L.columns), "excluded": [], "pvalues": {},
+            "note": "MCS needs >= 2 models and >= 10 aligned observations.",
+        }
+    from arch.bootstrap import MCS
+
+    if block_size is None:
+        block_size = max(1, int(round(L.shape[0] ** (1.0 / 3.0))))
+    try:
+        mcs = MCS(L, size=alpha, reps=n_bootstrap, block_size=block_size, seed=seed)
+    except TypeError:  # older/newer arch without the seed kwarg
+        mcs = MCS(L, size=alpha, reps=n_bootstrap, block_size=block_size)
+    mcs.compute()
+
+    pvals = {str(idx): float(row.iloc[0]) for idx, row in mcs.pvalues.iterrows()}
+    return {
+        "included": [str(c) for c in mcs.included],
+        "excluded": [str(c) for c in mcs.excluded],
+        "pvalues": pvals,
+    }
+
+
+def spa_test(
+    benchmark_losses: np.ndarray,
+    model_losses,
+    n_bootstrap: int = 1000,
+    block_size: int | None = None,
+    seed: int = 0,
+) -> dict:
+    """Hansen (2005) Superior Predictive Ability test against a benchmark.
+
+    Tests H0: no model in ``model_losses`` has lower expected loss than
+    ``benchmark_losses`` (the no-change forecast is the natural benchmark
+    here).  A small ``pvalue_consistent`` is evidence that at least one
+    challenger genuinely beats the benchmark after data-snooping adjustment.
+
+    Returns:
+        Dict with ``pvalue_lower`` / ``pvalue_consistent`` / ``pvalue_upper``
+        (Hansen's three p-value variants).
+    """
+    bench = np.asarray(benchmark_losses, dtype=np.float64)
+    models = pd.DataFrame(model_losses)
+    aligned = pd.concat([pd.Series(bench, name="_bench"), models.reset_index(drop=True)], axis=1).dropna()
+    if aligned.shape[0] < 10 or models.shape[1] < 1:
+        return {"pvalue_lower": float("nan"), "pvalue_consistent": float("nan"),
+                "pvalue_upper": float("nan"), "note": "SPA needs >= 10 aligned observations."}
+    from arch.bootstrap import SPA
+
+    b = aligned["_bench"].to_numpy()
+    m = aligned.drop(columns="_bench").to_numpy()
+    if block_size is None:
+        block_size = max(1, int(round(aligned.shape[0] ** (1.0 / 3.0))))
+    try:
+        spa = SPA(b, m, reps=n_bootstrap, block_size=block_size, seed=seed)
+    except TypeError:
+        spa = SPA(b, m, reps=n_bootstrap, block_size=block_size)
+    spa.compute()
+    p = spa.pvalues  # Series indexed by ['lower', 'consistent', 'upper']
+    return {
+        "pvalue_lower": float(p["lower"]),
+        "pvalue_consistent": float(p["consistent"]),
+        "pvalue_upper": float(p["upper"]),
+    }
 
 
 # ─────────────────────────────────────────────
@@ -1095,7 +1465,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
 
     # Build the full feature matrix, then restrict to the columns the model
     # was actually trained on (stepwise selection may have dropped features).
-    X_full, y_model, all_feature_names, target_dates = build_feature_matrix(
+    X_full, y_model, all_feature_names, target_dates, _t1 = build_feature_matrix(
         df, target, target_transform=target_transform,
     )
     saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
@@ -1211,7 +1581,7 @@ def run_evaluation(config: dict) -> pd.DataFrame:
                        dist=dist_model)
 
     # Genuine T+1 forecast: predict tomorrow using today's (last available) features
-    X_full_0, _, _, _ = build_feature_matrix(
+    X_full_0, _, _, _, _ = build_feature_matrix(
         df, target, forecast_horizon=0, target_transform=target_transform,
     )
     X_latest = X_full_0[-1:, col_idx]

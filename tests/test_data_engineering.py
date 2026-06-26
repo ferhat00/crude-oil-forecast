@@ -640,14 +640,14 @@ class TestTargetForwardShift:
         """y[i] must equal the raw close at row i+1 (T+1 semantics)."""
         df, build_feature_matrix = self._make_df()
         raw_close = df["CL=F_close"].values.copy()
-        _, y, _, _ = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
+        _, y, _, _, _ = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
         # y comes from raw_close[1:], so y[i] == raw_close[i+1]
         np.testing.assert_array_equal(y, raw_close[1:])
 
     def test_feature_row_i_predicts_target_i_plus_1(self):
         """X has n-1 rows; target_dates[i] is the date of raw_close[i+1]."""
         df, build_feature_matrix = self._make_df()
-        X, y, _, target_dates = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
+        X, y, _, target_dates, _ = build_feature_matrix(df, "CL=F_close", forecast_horizon=1)
         assert len(X) == len(df) - 1
         assert len(y) == len(df) - 1
         # target_dates[0] is the second calendar date (the day being predicted)
@@ -657,5 +657,5 @@ class TestTargetForwardShift:
         """forecast_horizon=0 must not drop any rows (used for live prediction)."""
         df, build_feature_matrix = self._make_df()
         df_clean = df.dropna()  # drop the NaN lag row
-        X, y, _, _ = build_feature_matrix(df_clean, "CL=F_close", forecast_horizon=0)
+        X, y, _, _, _ = build_feature_matrix(df_clean, "CL=F_close", forecast_horizon=0)
         assert len(X) == len(df_clean)

@@ -34,6 +34,10 @@ PUBLICATION_LAG_DAYS = {
     "eia": 5,
     "cot": 3,
     "alpha_vantage": 30,
+    # GPR daily index: published with ~1-day lag (small backfill revisions).
+    "gpr": 1,
+    # GECON monthly factor: released early the following month.
+    "gecon": 30,
 }
 
 
@@ -60,6 +64,7 @@ FRED_PUBLICATION_LAG_DAYS = {
     "pmi_mfg":      32,   # ISM PMI, 1st business day next month
     "miles_driven": 75,   # FHWA traffic volume trends, ~2-month lag
     "epu_global":   38,   # Global EPU monthly, early next month
+    "igrea":        45,   # Kilian real-activity index, Dallas Fed mid next month
     # ── Weekly series (indexed at week-ending day) ───────────────────────
     "nfci":          7,   # Chicago Fed, Wed release for prior Fri week
     "stlfsi":        7,   # St. Louis Fed FSI4, weekly Thu release
@@ -73,7 +78,9 @@ FRED_PUBLICATION_LAG_DAYS = {
     "t10yie":      0,
     "ovx":         0,
     "hy_spread":   0,
-    "epu_us":      0,
+    # USEPUINDXD revises its trailing ~month, so using it at lag 0 is a real
+    # look-ahead.  Hold it back 30 days to the point the value is settled.
+    "epu_us":      30,
     "ig_spread":   0,
     "ted_spread":  0,
     "rrp":         0,
@@ -101,6 +108,8 @@ def merge_datasets(
     market_df: pd.DataFrame | None = None,
     cot_df: pd.DataFrame | None = None,
     alpha_vantage_df: pd.DataFrame | None = None,
+    gpr_df: pd.DataFrame | None = None,
+    gecon_df: pd.DataFrame | None = None,
     publication_lags: dict[str, int] | None = None,
     fred_publication_lags: dict[str, int] | None = None,
 ) -> pd.DataFrame:
@@ -206,6 +215,18 @@ def merge_datasets(
         )
         av_daily = av_shifted.resample("D").ffill()
         merged = merged.join(av_daily, how="left")
+
+    # Daily Geopolitical Risk index (small backfill lag, then ffill to weekends)
+    if gpr_df is not None and not gpr_df.empty:
+        gpr_shifted = _shift_publication_lag(gpr_df, int(lags.get("gpr", 1)))
+        gpr_daily = gpr_shifted.resample("D").ffill()
+        merged = merged.join(gpr_daily, how="left")
+
+    # Monthly GECON global economic conditions (release-date shift → daily ffill)
+    if gecon_df is not None and not gecon_df.empty:
+        gecon_shifted = _shift_publication_lag(gecon_df, int(lags.get("gecon", 30)))
+        gecon_daily = gecon_shifted.resample("D").ffill()
+        merged = merged.join(gecon_daily, how="left")
 
     # Forward-fill remaining NaN from weekends / different trading calendars
     merged = merged.ffill()
@@ -613,6 +634,134 @@ def add_inventory_change_features(
     return df
 
 
+def add_inventory_seasonal_features(
+    df: pd.DataFrame,
+    stock_cols: list[str] | None = None,
+    n_years: int = 5,
+) -> pd.DataFrame:
+    """Add inventory deviation-from-seasonal-norm and announcement-surprise.
+
+    Raw stock *levels* are strongly seasonal (refinery maintenance, driving
+    season), so the price-relevant signal is the deviation of stocks from their
+    *normal* level for the time of year — Ye, Zyren & Shore (2005), one of the
+    best-documented oil fundamentals.  For each ISO week-of-year we form the
+    trailing ``n_years`` mean and std of the inventory **from prior years only**
+    (no look-ahead), and store:
+
+    * ``{col}_seasonal_dev`` — level minus the same-week prior-years mean;
+    * ``{col}_seasonal_z`` — that deviation standardised by the same-week std;
+    * ``{col}_seasonal_z_pos`` / ``_z_neg`` — the positive / negative parts,
+      so the GAM can fit the asymmetric low- vs high-inventory response (low
+      inventories matter more, Ye et al.);
+    * ``{col}_surprise`` — the announcement *surprise* (actual weekly change
+      minus the typical seasonal change for that week), placed only on the
+      release day and zero otherwise (Miao et al. 2018 find WTI reacts to the
+      surprise component of the EIA print, not the raw change).
+
+    The input series are the publication-lag-shifted, forward-filled daily
+    inventories from :func:`merge_datasets`, so all derived features inherit the
+    correct as-of timing.  Seasonality is keyed on the *date index's* week-of-
+    year; because the EIA value reflects a reference week ~10 days earlier this
+    carries a small (≤ 2 week) phase shift, immaterial at weekly resolution.
+
+    Args:
+        df: Merged daily DataFrame (must have a DatetimeIndex).
+        stock_cols: Inventory columns to process (default: crude / cushing /
+            gasoline / distillate stocks, whichever are present).
+        n_years: Number of prior years in the trailing seasonal window.
+
+    Returns:
+        DataFrame with the seasonal-deviation and surprise columns added.
+    """
+    if stock_cols is None:
+        stock_cols = ["crude_stocks", "cushing_stocks", "gasoline_stocks",
+                      "distillate_stocks"]
+
+    iso = df.index.isocalendar()
+    woy = iso["week"].astype(int).to_numpy()
+    yw_key = iso["year"].astype(int).to_numpy() * 100 + woy  # ISO year-week id
+    yw_series = pd.Series(yw_key, index=df.index)
+    # First trading day of each ISO year-week = the inventory release/step day.
+    is_release = ~yw_series.duplicated()
+
+    for col in stock_cols:
+        if col not in df.columns:
+            continue
+
+        # Collapse to one representative (last) value per ISO year-week.
+        wk = pd.DataFrame({"val": df[col].to_numpy(), "woy": woy, "yw": yw_key})
+        wk = wk.groupby("yw", sort=True).agg(val=("val", "last"),
+                                             woy=("woy", "first"))
+
+        # Trailing same-week-of-year mean/std from PRIOR years only (shift(1)).
+        grp = wk.groupby("woy")["val"]
+        norm = grp.transform(lambda x: x.shift(1).rolling(n_years, min_periods=2).mean())
+        sd = grp.transform(lambda x: x.shift(1).rolling(n_years, min_periods=2).std())
+        wk["dev"] = wk["val"] - norm
+        wk["z"] = wk["dev"] / sd.replace(0, np.nan)
+
+        # Announcement surprise: weekly change minus the typical same-week change.
+        wk["chg"] = wk["val"].diff()
+        exp_chg = wk.groupby("woy")["chg"].transform(
+            lambda x: x.shift(1).rolling(n_years, min_periods=2).mean()
+        )
+        wk["surprise"] = wk["chg"] - exp_chg
+
+        # Map the year-week statistics back onto the daily index.
+        dev_map = wk["dev"].to_dict()
+        z_map = wk["z"].to_dict()
+        surprise_map = wk["surprise"].to_dict()
+
+        df[f"{col}_seasonal_dev"] = yw_series.map(dev_map)
+        z = yw_series.map(z_map)
+        df[f"{col}_seasonal_z"] = z
+        df[f"{col}_seasonal_z_pos"] = z.clip(lower=0)
+        df[f"{col}_seasonal_z_neg"] = z.clip(upper=0)
+
+        surprise = pd.Series(0.0, index=df.index)
+        surprise.loc[is_release] = yw_series[is_release].map(surprise_map)
+        df[f"{col}_surprise"] = surprise.fillna(0.0)
+
+    logger.info(
+        f"Added inventory seasonal-deviation + surprise features "
+        f"({n_years}-year norm) for {stock_cols}."
+    )
+    return df
+
+
+def add_gpr_features(
+    df: pd.DataFrame,
+    gpr_col: str = "gpr",
+    trend_window: int = 30,
+    spike_window: int = 252,
+    spike_quantile: float = 0.90,
+) -> pd.DataFrame:
+    """Engineer Geopolitical Risk features (level, trend, spike).
+
+    The oil literature finds GPR's predictive content sits in *trend*
+    transformations and *spikes*, not the raw level (Caldara & Iacoviello
+    2022; the 2022 *Energy* study).  Adds:
+
+    * ``gpr_log`` — log level (GPR is right-skewed);
+    * ``gpr_trend_{w}`` — ``trend_window``-day moving average of the log level;
+    * ``gpr_spike`` — 1 when GPR exceeds its trailing causal
+      ``spike_quantile`` over ``spike_window`` days, else 0.
+
+    Returns the DataFrame unchanged when ``gpr_col`` is absent.
+    """
+    if gpr_col not in df.columns:
+        return df
+    g = df[gpr_col].clip(lower=1e-6)
+    df["gpr_log"] = np.log(g)
+    df[f"gpr_trend_{trend_window}"] = (
+        df["gpr_log"].rolling(trend_window, min_periods=trend_window).mean()
+    )
+    roll_q = df[gpr_col].rolling(spike_window, min_periods=60).quantile(spike_quantile)
+    df["gpr_spike"] = (df[gpr_col] > roll_q).astype(float)
+    logger.info("Added GPR features (log level, trend, spike dummy).")
+    return df
+
+
 def add_price_level_features(
     df: pd.DataFrame,
     target_col: str,
@@ -690,6 +839,95 @@ def add_atr_features(
     df[f"{close_col}_atr_{period}"] = atr
     df[f"{close_col}_atr_pct_{period}"] = atr / close
 
+    return df
+
+
+def add_range_volatility(
+    df: pd.DataFrame,
+    high_col: str,
+    low_col: str,
+    open_col: str,
+    close_col: str,
+    windows: list[int] | None = None,
+) -> pd.DataFrame:
+    """Add range-based realised-volatility estimators from daily OHLC.
+
+    Close-to-close volatility throws away the intraday path; range estimators
+    that use the open/high/low are 5–14x more *efficient* (Parkinson 1980;
+    Garman-Klass 1980; Rogers-Satchell 1991; Yang-Zhang 2000) — free signal
+    given that yfinance already provides OHLC.  Each estimator is a per-day
+    variance proxy averaged over a rolling ``window``; the stored feature is
+    the resulting daily **volatility** (the square root), in log-return units:
+
+    * **Parkinson** — high-low range only; most efficient under zero drift, but
+      ignores gaps and drift.
+    * **Garman-Klass** — adds the open-close move; more efficient still.
+    * **Rogers-Satchell** — drift-independent (valid when the price trends).
+    * **Yang-Zhang** — combines overnight, open-to-close and Rogers-Satchell;
+      robust to both overnight gaps and drift, the lowest-variance estimator.
+
+    These feed both the mean GAM (as volatility-regime features) and the σ
+    sub-model / GARCH scale (see :data:`src.model.SIGMA_FEATURE_PATTERNS`).
+
+    Args:
+        df: DataFrame containing the OHLC columns.
+        high_col, low_col, open_col, close_col: OHLC column names.  ``close_col``
+            is also used as the feature-name prefix.
+        windows: Rolling windows in trading days (default ``[5, 20, 60]``).
+
+    Returns:
+        DataFrame with ``{close_col}_{parkinson,garman_klass,rogers_satchell,
+        yang_zhang}_{w}`` columns added.
+    """
+    if windows is None:
+        windows = [5, 20, 60]
+    for col in (high_col, low_col, open_col, close_col):
+        if col not in df.columns:
+            logger.warning(f"Range volatility skipped: '{col}' not in columns.")
+            return df
+
+    high = df[high_col]
+    low = df[low_col]
+    open_ = df[open_col]
+    close = df[close_col]
+    prev_close = close.shift(1)
+
+    # Per-day log terms (NaN where a price is non-positive, e.g. the Apr-2020
+    # negative WTI print — consistent with add_return_features' handling).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_hl = np.log(high / low)
+        log_co = np.log(close / open_)
+        log_ho = np.log(high / open_)
+        log_lo = np.log(low / open_)
+        log_hc = np.log(high / close)
+        log_lc = np.log(low / close)
+        log_oc_prev = np.log(open_ / prev_close)  # overnight jump
+
+    # Per-day variance proxies.
+    parkinson_day = (log_hl ** 2) / (4.0 * np.log(2.0))
+    gk_day = 0.5 * log_hl ** 2 - (2.0 * np.log(2.0) - 1.0) * log_co ** 2
+    rs_day = log_hc * log_ho + log_lc * log_lo  # Rogers-Satchell (drift-free)
+
+    for w in windows:
+        mp = w  # require a full window
+        pk_var = parkinson_day.rolling(w, min_periods=mp).mean()
+        gk_var = gk_day.rolling(w, min_periods=mp).mean()
+        rs_var = rs_day.rolling(w, min_periods=mp).mean()
+
+        # Yang-Zhang: overnight + k·open-close + (1-k)·Rogers-Satchell.
+        k = 0.34 / (1.34 + (w + 1) / (w - 1)) if w > 1 else 0.34
+        var_overnight = log_oc_prev.rolling(w, min_periods=mp).var()
+        var_openclose = log_co.rolling(w, min_periods=mp).var()
+        yz_var = var_overnight + k * var_openclose + (1.0 - k) * rs_var
+
+        df[f"{close_col}_parkinson_{w}"] = np.sqrt(pk_var.clip(lower=0))
+        df[f"{close_col}_garman_klass_{w}"] = np.sqrt(gk_var.clip(lower=0))
+        df[f"{close_col}_rogers_satchell_{w}"] = np.sqrt(rs_var.clip(lower=0))
+        df[f"{close_col}_yang_zhang_{w}"] = np.sqrt(yz_var.clip(lower=0))
+
+    logger.info(
+        f"Added range-based volatility (Parkinson/GK/RS/YZ) for windows {windows}."
+    )
     return df
 
 
@@ -952,6 +1190,7 @@ def build_features(config: dict) -> pd.DataFrame:
     stoch_k = feat_cfg.get("stochastic_k_period", 14)
     stoch_d = feat_cfg.get("stochastic_d_period", 3)
     cmf_period = feat_cfg.get("cmf_period", 20)
+    range_vol_windows = feat_cfg.get("range_vol_windows", [5, 20, 60])
     corr_windows = feat_cfg.get("correlation_windows", [30, 90])
     corr_pairs = feat_cfg.get("correlation_pairs", [])
     mom_windows = feat_cfg.get("momentum_windows", [21, 63, 126])
@@ -985,6 +1224,18 @@ def build_features(config: dict) -> pd.DataFrame:
         alpha_vantage_df = pd.read_parquet(av_path)
         logger.info(f"Loaded Alpha Vantage data: {list(alpha_vantage_df.columns)}")
 
+    gpr_df = None
+    gpr_path = raw_dir / "gpr.parquet"
+    if gpr_path.exists():
+        gpr_df = pd.read_parquet(gpr_path)
+        logger.info(f"Loaded GPR data: {len(gpr_df)} rows")
+
+    gecon_df = None
+    gecon_path = raw_dir / "gecon.parquet"
+    if gecon_path.exists():
+        gecon_df = pd.read_parquet(gecon_path)
+        logger.info(f"Loaded GECON data: {len(gecon_df)} rows")
+
     logger.info(f"Oil price columns: {list(oil_df.columns)}")
 
     # ── Merge ─────────────────────────────────────────
@@ -993,6 +1244,8 @@ def build_features(config: dict) -> pd.DataFrame:
         oil_df, fred_df, eia_dfs, market_df,
         cot_df=cot_df,
         alpha_vantage_df=alpha_vantage_df,
+        gpr_df=gpr_df,
+        gecon_df=gecon_df,
         publication_lags=data_cfg.get("publication_lags"),
         fred_publication_lags=data_cfg.get("fred_publication_lags"),
     )
@@ -1039,6 +1292,8 @@ def build_features(config: dict) -> pd.DataFrame:
             "fed_balance", "rrp",
             # Credit / risk appetite
             "ig_spread", "ted_spread",
+            # Global real activity (Kilian index, Baumeister GECON)
+            "igrea", "gecon",
         ]
         if c in df.columns
     ]
@@ -1061,6 +1316,13 @@ def build_features(config: dict) -> pd.DataFrame:
     cot_cols = [c for c in df.columns if c.startswith("cot_")]
     if cot_cols:
         df = add_exogenous_lags(df, cot_cols, lags=[7, 14])
+        # COT flow momentum: 4- and 13-week *changes* in net positioning carry
+        # the risk-premium signal, not the levels (Singleton 2014).  Series are
+        # weekly forward-filled to daily, so 20/65 trading days ≈ 4/13 weeks.
+        for fc in ("cot_mm_net", "cot_commercial_net"):
+            if fc in df.columns:
+                df[f"{fc}_chg_4w"] = df[fc].diff(20)
+                df[f"{fc}_chg_13w"] = df[fc].diff(65)
 
     # 3b. Alpha Vantage economic indicator lags
     av_cols = [c for c in df.columns if c.startswith("av_")]
@@ -1096,6 +1358,7 @@ def build_features(config: dict) -> pd.DataFrame:
     # 6b. ATR, Williams %R, Stochastic, CMF (use WTI OHLCV)
     wti_high = "CL=F_high" if "CL=F_high" in df.columns else None
     wti_low = "CL=F_low" if "CL=F_low" in df.columns else None
+    wti_open = "CL=F_open" if "CL=F_open" in df.columns else None
     wti_vol = "CL=F_volume" if "CL=F_volume" in df.columns else None
     if wti_col and wti_high and wti_low:
         df = add_atr_features(df, wti_high, wti_low, wti_col, atr_period)
@@ -1103,6 +1366,11 @@ def build_features(config: dict) -> pd.DataFrame:
         df = add_stochastic(df, wti_high, wti_low, wti_col, stoch_k, stoch_d)
         if wti_vol:
             df = add_cmf(df, wti_high, wti_low, wti_col, wti_vol, cmf_period)
+        # Range-based realised volatility (Parkinson/GK/Rogers-Satchell/Yang-Zhang)
+        if wti_open:
+            df = add_range_volatility(
+                df, wti_high, wti_low, wti_open, wti_col, range_vol_windows
+            )
 
     # 6c. Rolling cross-asset correlations
     if corr_pairs:
@@ -1139,6 +1407,16 @@ def build_features(config: dict) -> pd.DataFrame:
 
     # 13. EIA inventory week-on-week changes (used by interaction whitelist)
     df = add_inventory_change_features(df)
+
+    # 13b. Inventory deviation-from-seasonal-norm + announcement surprise
+    df = add_inventory_seasonal_features(df)
+
+    # 13c. Geopolitical Risk features (log level, trend, spike), if GPR present
+    df = add_gpr_features(df)
+
+    # 13d. GECON 3-month change (≈ 63 trading days), if present
+    if "gecon" in df.columns:
+        df["gecon_chg_3m"] = df["gecon"].diff(63)
 
     # ── Drop warm-up NaN rows ─────────────────────────
     before = len(df)

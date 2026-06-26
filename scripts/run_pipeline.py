@@ -46,6 +46,74 @@ def setup_logging() -> None:
     )
 
 
+def _run_cpcv_step(config: dict, cpcv_cfg: dict, logger: logging.Logger) -> None:
+    """Run CPCV backtest on the trained-feature set and persist results.
+
+    Uses the same feature pipeline as the walk-forward backtest but fits a
+    fresh GAM per CPCV combination on the *selected* feature columns so
+    stepwise drops are honoured.
+    """
+    from src.cpcv_backtest import make_gam_factory, run_cpcv_backtest
+    from src.model import compute_anchor_prices, define_gam_terms, get_target_y_level
+
+    root = get_project_root(config)
+    feat_cfg = config["features"]
+    target = feat_cfg["target"]
+    target_transform = feat_cfg.get("target_transform", "level")
+
+    df = pd.read_parquet(root / "data" / "processed" / "features.parquet")
+    X_full, y_model, all_feature_names, target_dates, t1 = build_feature_matrix(
+        df, target, target_transform=target_transform,
+    )
+
+    # Restrict to the model's selected features (mirrors evaluation/dashboard).
+    saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
+    feature_names = (
+        load_feature_names(saved_names_path)
+        if saved_names_path.exists() else all_feature_names
+    )
+    name_to_idx = {n: i for i, n in enumerate(all_feature_names)}
+    col_idx = [name_to_idx[n] for n in feature_names if n in name_to_idx]
+    X = X_full[:, col_idx]
+
+    transformer_path = root / "outputs" / "models" / "feature_transformer.pkl"
+    if transformer_path.exists():
+        transformer = joblib.load(transformer_path)
+        X = transformer.transform(X)
+
+    # Build a fresh terms factory each fit (pyGAM mutates terms during fit).
+    feature_names_for_factory = list(feature_names)
+
+    def _terms_factory():
+        return define_gam_terms(feature_names_for_factory, config)
+
+    from src.config_loader import resolve_model_config
+    model_cfg = resolve_model_config(config)
+    model_factory = make_gam_factory(
+        _terms_factory, lam_values=model_cfg.get("lam_search"),
+    )
+
+    anchor = compute_anchor_prices(df, target, forecast_horizon=1)
+    y_level = get_target_y_level(df, target, forecast_horizon=1)
+
+    output_dir = root / "outputs" / "backtests" / "cpcv"
+    result = run_cpcv_backtest(
+        X, y_model, t1, model_factory,
+        anchor=anchor,
+        y_level=y_level,
+        target_dates=target_dates,
+        n_splits=int(cpcv_cfg.get("n_splits", 6)),
+        n_test_splits=int(cpcv_cfg.get("n_test_splits", 2)),
+        pct_embargo=float(cpcv_cfg.get("pct_embargo", 0.01)),
+        output_dir=output_dir,
+        n_jobs=int(model_cfg.get("n_jobs", 1)),
+    )
+
+    logger.info("CPCV summary:")
+    for k, v in result.summary.items():
+        logger.info(f"  {k:20s} {v}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Crude oil price forecasting pipeline"
@@ -64,6 +132,15 @@ def main() -> None:
         "--skip-backtest",
         action="store_true",
         help="Skip walk-forward backtest (slow; defaults to running)",
+    )
+    parser.add_argument(
+        "--cpcv",
+        action="store_true",
+        help=(
+            "Also run the Combinatorial Purged CV backtester (Ch. 12). "
+            "Writes outputs/backtests/cpcv/. Can be enabled persistently "
+            "via the cpcv: section in config.yaml."
+        ),
     )
     args = parser.parse_args()
 
@@ -120,10 +197,35 @@ def main() -> None:
         for k, v in bt_result.scores.items():
             logger.info(f"  {k:30s} {v}")
 
+        # Density-weighted acceptance gate (Phase 0): the headline numbers a
+        # change must not worsen.  Lower CRPS/log-score is better; MSPE ratio
+        # < 1 beats no-change; small DM/PT p-values mean the edge is real;
+        # large Berkowitz p-value means the fan chart is calibrated.
+        s = bt_result.scores
+        logger.info(
+            "GATE | CRPS=%.5f log_score=%.4f | MSPE_ratio=%.4f (DM p=%.3f) | "
+            "dir_acc=%.3f (PT p=%.3f) | Berkowitz p=%.3f",
+            s.get("crps_mean_model", float("nan")),
+            s.get("log_score_mean_model", float("nan")),
+            s.get("mspe_ratio", float("nan")),
+            s.get("dm_pvalue", float("nan")),
+            s.get("directional_accuracy", float("nan")),
+            s.get("pt_pvalue", float("nan")),
+            s.get("berkowitz_pvalue_model", float("nan")),
+        )
+
         # Bates-Granger optimal naive combination weights
         logger.info("Computing Bates-Granger combination weights against naive baseline…")
         weights = fit_from_backtest(bt_result.path)
         save_combination_weights(weights, config)
+
+    # Step 6.5: Combinatorial Purged CV (Ch. 12) — optional second backtester
+    cpcv_cfg = (config.get("cpcv") or {})
+    if args.cpcv or cpcv_cfg.get("enabled", False):
+        logger.info("=" * 60)
+        logger.info("STEP 6.5: Combinatorial Purged CV Backtest")
+        logger.info("=" * 60)
+        _run_cpcv_step(config, cpcv_cfg, logger)
 
     # Step 7: Next-Day Forecast
     logger.info("=" * 60)
@@ -139,7 +241,7 @@ def main() -> None:
     # Load trained model and its selected feature names
     gam = load_model(root / "outputs" / "models" / "gam_model.pkl")
     saved_names_path = root / "outputs" / "models" / "feature_names.pkl"
-    X_full, _, all_feature_names, _ = build_feature_matrix(
+    X_full, _, all_feature_names, _, _ = build_feature_matrix(
         df, target, forecast_horizon=0, target_transform=target_transform,
     )
     feature_names = (
@@ -257,6 +359,8 @@ def main() -> None:
     if bt_result is not None:
         logger.info("  - Backtest path:  outputs/backtest_path.parquet")
         logger.info("  - Combo weights:  outputs/combination_weights.json")
+    if args.cpcv or (config.get("cpcv") or {}).get("enabled", False):
+        logger.info("  - CPCV results:   outputs/backtests/cpcv/")
     logger.info("  - Run dashboard:  streamlit run app/dashboard.py")
     logger.info("=" * 60)
 
